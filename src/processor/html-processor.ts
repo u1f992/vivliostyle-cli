@@ -17,8 +17,8 @@ import fs from 'node:fs';
  *      `- xast-util-to-xml@3: https://github.com/syntax-tree/xast-util-to-xml/blob/3.0.2/package.json#L34
  *      `- xastscript@3: https://github.com/syntax-tree/xastscript/blob/3.1.1/package.json#L48
  */
-import type * as hast from 'hast-v2';
-import { h } from 'hastscript-v7';
+import type * as hast from 'hast';
+import { h } from 'hastscript';
 import rehype from 'rehype';
 import unified from 'unified';
 import { u } from 'unist-builder';

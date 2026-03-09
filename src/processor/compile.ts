@@ -1,9 +1,10 @@
-import jsdom, { JSDOM } from '@vivliostyle/jsdom';
+import type * as hast from 'hast';
+import { toHtml } from 'hast-util-to-html';
 import { copy, move } from 'fs-extra/esm';
 import fs from 'node:fs';
 import upath from 'upath';
-import serializeToXml from 'w3c-xmlserializer';
 import MIMEType from 'whatwg-mimetype';
+import rehype from 'rehype';
 import type {
   ContentsEntry,
   CoverEntry,
@@ -25,14 +26,11 @@ import {
   writeFileIfChanged,
 } from '../util.js';
 import {
-  createVirtualConsole,
   generateDefaultCoverHtml,
   generateDefaultTocHtml,
-  getJsdomFromString,
-  getJsdomFromUrlOrFile,
   processCoverHtml,
   processTocHtml,
-  ResourceLoader,
+  ResourceFetcher,
 } from './html.js';
 import {
   defaultHtmlProcessor,
@@ -180,8 +178,9 @@ export async function transformManuscript(
     entry.rel === 'contents' || entry.rel === 'cover'
       ? (entry as ContentsEntry | CoverEntry).template
       : (entry as ManuscriptEntry).source;
-  let content: JSDOM | undefined;
-  let resourceLoader: ResourceLoader | undefined;
+  let tree: hast.Root | undefined;
+  let contentType: 'text/html' | 'application/xhtml+xml' = 'text/html';
+  let resourceFetcher: ResourceFetcher | undefined;
   let resourceUrl: string | undefined;
 
   // calculate style path
@@ -203,7 +202,9 @@ export async function transformManuscript(
           language: language ?? undefined,
         },
       );
-      content = getJsdomFromString({ html: String(vfile) });
+      tree = rehype()
+        .data('settings', { fragment: false })
+        .parse(String(vfile)) as unknown as hast.Root;
     } else if (
       source.contentType === 'text/html' ||
       source.contentType === 'application/xhtml+xml'
@@ -215,10 +216,10 @@ export async function transformManuscript(
         contentType: source.contentType,
         language: language ?? undefined,
       });
-      content = getJsdomFromString({
-        html: String(vfile),
-        contentType: source.contentType,
-      });
+      tree = rehype()
+        .data('settings', { fragment: false })
+        .parse(String(vfile)) as unknown as hast.Root;
+      contentType = source.contentType;
     } else {
       if (!pathEquals(source.pathname, entry.target)) {
         await copy(source.pathname, entry.target);
@@ -228,39 +229,29 @@ export async function transformManuscript(
     resourceUrl = /^https?:/.test(source.href)
       ? source.href
       : `${rootUrl}${source.href}`;
-    resourceLoader = new ResourceLoader();
+    resourceFetcher = new ResourceFetcher();
     try {
-      await getJsdomFromUrlOrFile({
-        src: resourceUrl,
-        resourceLoader,
-        virtualConsole: createVirtualConsole((error) => {
-          Logger.logError(`Failed to fetch resources: ${error.detail}`);
-        }),
-      });
-    } catch (error: any) {
-      throw new DetailError(
-        `Failed to fetch the content from ${resourceUrl}`,
-        error.stack ?? error.message,
-      );
-    }
-
-    const contentFetcher = resourceLoader.fetcherMap.get(resourceUrl);
-    if (contentFetcher) {
-      const buffer = await contentFetcher;
-      const contentTypeHeader =
-        contentFetcher.response?.headers['content-type'];
-      const contentType = contentTypeHeader
+      const buffer = await resourceFetcher.fetch(resourceUrl);
+      if (!buffer) {
+        throw new Error(`Failed to fetch the content from ${resourceUrl}`);
+      }
+      const contentFetcher = resourceFetcher.fetcherMap.get(resourceUrl);
+      const contentTypeHeader = contentFetcher
+        ? (await contentFetcher)?.contentType
+        : undefined;
+      const fetchedContentType = contentTypeHeader
         ? new MIMEType(contentTypeHeader).essence
         : undefined;
       if (
-        contentType !== 'text/html' &&
-        contentType !== 'application/xhtml+xml'
+        fetchedContentType !== 'text/html' &&
+        fetchedContentType !== 'application/xhtml+xml'
       ) {
         throw new Error(`The content is not an HTML document: ${resourceUrl}`);
       }
 
+      contentType = fetchedContentType;
       const processor =
-        contentType === 'application/xhtml+xml'
+        fetchedContentType === 'application/xhtml+xml'
           ? (source.xhtmlProcessor ?? defaultXhtmlProcessor)
           : (source.htmlProcessor ?? defaultHtmlProcessor);
       const vfile = await processHtmlString(
@@ -269,14 +260,18 @@ export async function transformManuscript(
         {
           style,
           title: entry.title,
-          contentType,
+          contentType: fetchedContentType,
           language: language ?? undefined,
         },
       );
-      content = getJsdomFromString({
-        html: String(vfile),
-        contentType,
-      });
+      tree = rehype()
+        .data('settings', { fragment: false })
+        .parse(String(vfile)) as unknown as hast.Root;
+    } catch (error: any) {
+      throw new DetailError(
+        `Failed to fetch the content from ${resourceUrl}`,
+        error.stack ?? error.message,
+      );
     }
   } else if (entry.rel === 'contents') {
     const html = generateDefaultTocHtml({ language, title });
@@ -286,7 +281,9 @@ export async function transformManuscript(
       contentType: 'text/html',
       language: language ?? undefined,
     });
-    content = getJsdomFromString({ html: String(vfile) });
+    tree = rehype()
+      .data('settings', { fragment: false })
+      .parse(String(vfile)) as unknown as hast.Root;
   } else if (entry.rel === 'cover') {
     const html = generateDefaultCoverHtml({ language, title: entry.title });
     const vfile = await processHtmlString(defaultHtmlProcessor, html, {
@@ -295,10 +292,12 @@ export async function transformManuscript(
       contentType: 'text/html',
       language: language ?? undefined,
     });
-    content = getJsdomFromString({ html: String(vfile) });
+    tree = rehype()
+      .data('settings', { fragment: false })
+      .parse(String(vfile)) as unknown as hast.Root;
   }
 
-  if (!content) {
+  if (!tree) {
     return;
   }
 
@@ -307,7 +306,7 @@ export async function transformManuscript(
     const manuscriptEntries = entries.filter(
       (e): e is ManuscriptEntry => 'source' in e,
     );
-    content = await processTocHtml(content, {
+    tree = await processTocHtml(tree, {
       entries: manuscriptEntries,
       manifestPath,
       distDir: upath.dirname(contentsEntry.target),
@@ -320,7 +319,7 @@ export async function transformManuscript(
 
   if (entry.rel === 'cover') {
     const coverEntry = entry as CoverEntry;
-    content = await processCoverHtml(content, {
+    tree = await processCoverHtml(tree, {
       imageSrc: upath.relative(
         upath.join(
           entryContextDir,
@@ -334,11 +333,11 @@ export async function transformManuscript(
     });
   }
 
-  let html;
-  if (content.window.document.contentType === 'application/xhtml+xml') {
-    html = `${XML_DECLARATION}\n${serializeToXml(content.window.document)}`;
+  let html: string;
+  if (contentType === 'application/xhtml+xml') {
+    html = `${XML_DECLARATION}\n${toHtml(tree, { space: 'svg', closeEmptyElements: true, allowDangerousHtml: true })}`;
   } else {
-    html = content.serialize();
+    html = toHtml(tree, { allowDangerousHtml: true });
   }
   const htmlBuffer = Buffer.from(html, 'utf8');
   if (
@@ -348,17 +347,13 @@ export async function transformManuscript(
     writeFileIfChanged(entry.target, htmlBuffer);
   }
 
-  if (source?.type === 'uri' && resourceLoader && resourceUrl) {
-    const { response } = resourceLoader.fetcherMap.get(resourceUrl)!;
-    const contentFetcher = Promise.resolve(
-      htmlBuffer,
-    ) as jsdom.AbortablePromise<Buffer>;
-    contentFetcher.abort = () => {};
-    contentFetcher.response = response;
-    resourceLoader.fetcherMap.set(resourceUrl, contentFetcher);
-
-    await ResourceLoader.saveFetchedResources({
-      fetcherMap: resourceLoader.fetcherMap,
+  if (source?.type === 'uri' && resourceFetcher && resourceUrl) {
+    resourceFetcher.fetcherMap.set(
+      resourceUrl,
+      Promise.resolve({ buffer: htmlBuffer, contentType: 'text/html' }),
+    );
+    await ResourceFetcher.saveFetchedResources({
+      fetcherMap: resourceFetcher.fetcherMap,
       rootUrl: resourceUrl,
       outputDir: source.rootDir,
     });

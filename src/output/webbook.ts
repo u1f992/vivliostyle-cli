@@ -1,8 +1,12 @@
 import { copy } from 'fs-extra/esm';
+import type * as hast from 'hast';
+import { toHtml } from 'hast-util-to-html';
 import { lookup as mime } from 'mime-types';
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import rehype from 'rehype';
 import { glob } from 'tinyglobby';
+import { EXIT, visit } from 'unist-util-visit';
 import upath from 'upath';
 import {
   type EpubOutput,
@@ -19,10 +23,8 @@ import {
   getWebPubResourceMatcher,
 } from '../processor/asset.js';
 import {
-  createVirtualConsole,
   fetchLinkedPublicationManifest,
-  getJsdomFromUrlOrFile,
-  ResourceLoader,
+  ResourceFetcher,
 } from '../processor/html.js';
 import type {
   PublicationLinks,
@@ -33,6 +35,7 @@ import type {
 import {
   assertPubManifestSchema,
   DetailError,
+  isValidUri,
   pathEquals,
   useTmpDirectory,
 } from '../util.js';
@@ -150,7 +153,7 @@ export function writePublicationManifest(
       });
     } else {
       Logger.logWarn(
-        `Cover image "${options.cover}" was set in your configuration but couldn’t detect the image metadata. Please check a valid cover file is placed.`,
+        `Cover image "${options.cover}" was set in your configuration but couldn't detect the image metadata. Please check a valid cover file is placed.`,
       );
     }
   }
@@ -193,6 +196,56 @@ export function writePublicationManifest(
   return publication;
 }
 
+/**
+ * Parse an HTML string into a hast tree.
+ */
+function parseHtml(html: string): hast.Root {
+  return rehype()
+    .data('settings', { fragment: false })
+    .parse(html) as unknown as hast.Root;
+}
+
+/**
+ * Read an HTML file and parse it into a hast tree.
+ */
+function parseHtmlFile(filePath: string): hast.Root {
+  const html = fs.readFileSync(filePath, 'utf8');
+  return parseHtml(html);
+}
+
+/**
+ * Fetch a URL and return its content as a buffer.
+ */
+async function fetchUrlToBuffer(
+  url: string,
+): Promise<{ buffer: Buffer; contentType?: string }> {
+  const urlObj = isValidUri(url) ? new URL(url) : pathToFileURL(url);
+  if (urlObj.protocol === 'file:') {
+    const buffer = fs.readFileSync(urlObj);
+    return { buffer };
+  }
+  if (urlObj.protocol === 'data:') {
+    // Parse data URI: data:[<mediatype>][;base64],<data>
+    const match = url.match(/^data:([^,]*),(.*)$/);
+    if (!match) {
+      throw new Error(`Invalid data URI: ${url.slice(0, 100)}`);
+    }
+    const meta = match[1];
+    const data = match[2];
+    const isBase64 = meta.endsWith(';base64');
+    const contentType =
+      (isBase64 ? meta.slice(0, -7) : meta).split(';')[0] || undefined;
+    const buffer = isBase64
+      ? Buffer.from(data, 'base64')
+      : Buffer.from(decodeURIComponent(data), 'utf8');
+    return { buffer, contentType };
+  }
+  const response = await globalThis.fetch(url);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const contentType = response.headers.get('content-type') ?? undefined;
+  return { buffer, contentType };
+}
+
 export async function retrieveWebbookEntry({
   viewerInput,
   outputDir,
@@ -209,19 +262,32 @@ export async function retrieveWebbookEntry({
   if (/^https?:/i.test(webbookEntryUrl)) {
     Logger.logUpdate('Fetching remote contents');
   }
-  const resourceLoader = new ResourceLoader();
-  const dom = await getJsdomFromUrlOrFile({
-    src: webbookEntryUrl,
-    resourceLoader,
-  });
+  const resourceFetcher = new ResourceFetcher();
+  const { buffer: entryBuffer } = await fetchUrlToBuffer(webbookEntryUrl);
+  const entryHtmlString = entryBuffer.toString('utf8');
+  const fetcherMapKey = webbookEntryUrl.startsWith('data:')
+    ? `${ResourceFetcher.dataUrlOrigin}index.html`
+    : webbookEntryUrl;
+  resourceFetcher.fetcherMap.set(
+    fetcherMapKey,
+    Promise.resolve({ buffer: entryBuffer, contentType: 'text/html' }),
+  );
+
+  const tree = parseHtml(entryHtmlString);
+
+  // Discover and fetch sub-resources from the entry HTML
+  await resourceFetcher.fetchSubResources(tree, webbookEntryUrl);
+
   const entryHtml = viewerInput.webbookPath
     ? upath.basename(viewerInput.webbookPath)
-    : decodeURI(dom.window.location.pathname);
+    : webbookEntryUrl.startsWith('data:')
+      ? 'index.html'
+      : decodeURI(new URL(webbookEntryUrl).pathname);
 
   const { manifest, manifestUrl } =
     (await fetchLinkedPublicationManifest({
-      dom,
-      resourceLoader,
+      tree,
+      resourceFetcher,
       baseUrl: webbookEntryUrl,
     })) || {};
 
@@ -235,7 +301,7 @@ export async function retrieveWebbookEntry({
     pathContains = (url: string) =>
       !upath.relative(rootUrl, url).startsWith('..');
   }
-  const retriever = new Map(resourceLoader.fetcherMap);
+  const retriever = new Map(resourceFetcher.fetcherMap);
 
   if (manifest && manifestUrl) {
     [manifest.resources || []].flat().forEach((v) => {
@@ -244,7 +310,8 @@ export async function retrieveWebbookEntry({
       if (!pathContains(fullUrl) || retriever.has(fullUrl)) {
         return;
       }
-      const fetchPromise = resourceLoader.fetch(fullUrl);
+      resourceFetcher.fetch(fullUrl);
+      const fetchPromise = resourceFetcher.fetcherMap.get(fullUrl);
       if (fetchPromise && !retriever.has(fullUrl)) {
         retriever.set(fullUrl, fetchPromise);
       }
@@ -261,21 +328,25 @@ export async function retrieveWebbookEntry({
       if (!pathContains(fullUrl) || fullUrl === webbookEntryUrl) {
         continue;
       }
-      const subpathResourceLoader = new ResourceLoader();
-      await getJsdomFromUrlOrFile({
-        src: fullUrl,
-        resourceLoader: subpathResourceLoader,
-        virtualConsole: createVirtualConsole((error) => {
-          Logger.logError(`Failed to fetch webbook resources: ${error.detail}`);
-        }),
-      });
-      subpathResourceLoader.fetcherMap.forEach(
+      const subpathResourceFetcher = new ResourceFetcher();
+      try {
+        const { buffer: subBuffer } = await fetchUrlToBuffer(fullUrl);
+        subpathResourceFetcher.fetcherMap.set(
+          fullUrl,
+          Promise.resolve({ buffer: subBuffer, contentType: 'text/html' }),
+        );
+        const subTree = parseHtml(subBuffer.toString('utf8'));
+        await subpathResourceFetcher.fetchSubResources(subTree, fullUrl);
+      } catch (error) {
+        Logger.logError(`Failed to fetch webbook resources: ${error}`);
+      }
+      subpathResourceFetcher.fetcherMap.forEach(
         (v, k) => !retriever.has(k) && retriever.set(k, v),
       );
     }
   }
 
-  const fetchedResources = await ResourceLoader.saveFetchedResources({
+  const fetchedResources = await ResourceFetcher.saveFetchedResources({
     fetcherMap: retriever,
     rootUrl: webbookEntryUrl,
     outputDir,
@@ -331,15 +402,47 @@ export async function supplyWebPublicationManifestForWebbook({
   outputDir: string;
 }): Promise<PublicationManifest> {
   Logger.debug(`Generating publication manifest from HTML: ${entryHtmlFile}`);
-  const dom = await getJsdomFromUrlOrFile({ src: entryHtmlFile });
-  const { document } = dom.window;
-  const language =
-    config.language || document.documentElement.lang || undefined;
-  const title = config.title || document.title || '';
-  const author =
-    config.author ||
-    document.querySelector('meta[name="author"]')?.getAttribute('content') ||
-    '';
+  const tree = parseHtmlFile(entryHtmlFile);
+
+  // Extract language from <html lang="...">
+  let language: string | undefined = config.language || undefined;
+  if (!language) {
+    visit(tree, 'element', (node: hast.Element) => {
+      if (node.tagName === 'html' && node.properties?.lang) {
+        language = String(node.properties.lang);
+        return EXIT;
+      }
+    });
+  }
+
+  // Extract title from <title>
+  let title: string = config.title || '';
+  if (!title) {
+    visit(tree, 'element', (node: hast.Element) => {
+      if (node.tagName === 'title') {
+        const textNode = node.children.find((c) => c.type === 'text');
+        if (textNode && textNode.type === 'text') {
+          title = textNode.value;
+        }
+        return EXIT;
+      }
+    });
+  }
+
+  // Extract author from <meta name="author" content="...">
+  let author: string = config.author || '';
+  if (!author) {
+    visit(tree, 'element', (node: hast.Element) => {
+      if (
+        node.tagName === 'meta' &&
+        node.properties?.name === 'author' &&
+        node.properties?.content
+      ) {
+        author = String(node.properties.content);
+        return EXIT;
+      }
+    });
+  }
 
   const entry = upath.relative(outputDir, entryHtmlFile);
   const allFiles = await glob('**', {
@@ -359,18 +462,32 @@ export async function supplyWebPublicationManifestForWebbook({
     },
   );
   sortManifestResources(manifest);
-  const link = document.createElement('link');
-  link.setAttribute('rel', 'publication');
-  link.setAttribute('type', 'application/ld+json');
-  link.setAttribute(
-    'href',
-    upath.relative(
-      upath.dirname(entryHtmlFile),
-      upath.join(outputDir, MANIFEST_FILENAME),
-    ),
+
+  // Add <link rel="publication"> to the HTML head
+  visit(tree, 'element', (node: hast.Element) => {
+    if (node.tagName === 'head') {
+      node.children.push({
+        type: 'element',
+        tagName: 'link',
+        properties: {
+          rel: 'publication',
+          type: 'application/ld+json',
+          href: upath.relative(
+            upath.dirname(entryHtmlFile),
+            upath.join(outputDir, MANIFEST_FILENAME),
+          ),
+        },
+        children: [],
+      });
+      return EXIT;
+    }
+  });
+
+  await fs.promises.writeFile(
+    entryHtmlFile,
+    toHtml(tree, { allowDangerousHtml: true }),
+    'utf8',
   );
-  document.head.appendChild(link);
-  await fs.promises.writeFile(entryHtmlFile, dom.serialize(), 'utf8');
 
   Logger.debug(
     'Generated publication manifest from HTML',

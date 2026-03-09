@@ -1,15 +1,17 @@
-import type { JSDOM } from '@vivliostyle/jsdom';
+import type * as hast from 'hast';
 import archiver from 'archiver';
 import { lookup as lookupLanguage } from 'bcp-47-match';
 import { XMLBuilder } from 'fast-xml-parser';
 import { copy } from 'fs-extra/esm';
 import GithubSlugger from 'github-slugger';
+import { toHtml } from 'hast-util-to-html';
 import { lookup as mime } from 'mime-types';
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import rehype from 'rehype';
+import { EXIT, visit } from 'unist-util-visit';
 import upath from 'upath';
 import { v4 as uuid } from 'uuid';
-import serializeToXml from 'w3c-xmlserializer';
 import {
   EPUB_CONTAINER_XML,
   EPUB_LANDMARKS_COVER_ENTRY,
@@ -23,7 +25,6 @@ import { Logger } from '../logger.js';
 import {
   type PageListResourceTreeRoot,
   type TocResourceTreeRoot,
-  getJsdomFromUrlOrFile,
   parsePageListDocument,
   parseTocDocument,
 } from '../processor/html.js';
@@ -118,6 +119,80 @@ const appendManifestProperty = (entry: ManifestEntry, newProperty: string) => {
       )
     : newProperty;
 };
+
+/** Parse an HTML string into a hast tree using rehype. */
+function parseHtmlToHast(html: string): hast.Root {
+  return rehype()
+    .data('settings', { allowDangerousHtml: true })
+    .parse(html) as unknown as hast.Root;
+}
+
+/** Serialize a hast tree to XHTML string with XML declaration. */
+function hastToXhtml(tree: hast.Root): string {
+  const html = toHtml(tree, {
+    space: 'svg',
+    closeEmptyElements: true,
+    allowDangerousHtml: true,
+    upperDoctype: true,
+  });
+  return `${XML_DECLARATION}\n${html}`;
+}
+
+/** Find the first element matching a predicate via tree traversal. */
+function findElement(
+  tree: hast.Root | hast.Element,
+  predicate: (node: hast.Element) => boolean,
+): hast.Element | undefined {
+  let found: hast.Element | undefined;
+  visit(tree, 'element', (node) => {
+    if (predicate(node)) {
+      found = node;
+      return EXIT;
+    }
+  });
+  return found;
+}
+
+/** Find all elements matching a predicate via tree traversal. */
+function findAllElements(
+  tree: hast.Root | hast.Element,
+  predicate: (node: hast.Element) => boolean,
+): hast.Element[] {
+  const results: hast.Element[] = [];
+  visit(tree, 'element', (node) => {
+    if (predicate(node)) {
+      results.push(node);
+    }
+  });
+  return results;
+}
+
+/** Get the text content of a hast element (recursive). */
+function getTextContent(node: hast.Element | hast.Root): string {
+  let text = '';
+  for (const child of node.children) {
+    if (child.type === 'text') {
+      text += child.value;
+    } else if (child.type === 'element') {
+      text += getTextContent(child);
+    }
+  }
+  return text;
+}
+
+/** Create a hast element node. */
+function h(
+  tagName: string,
+  properties: hast.Properties,
+  children: hast.ElementContent[] = [],
+): hast.Element {
+  return { type: 'element', tagName, properties, children };
+}
+
+/** Create a hast text node. */
+function text(value: string): hast.Text {
+  return { type: 'text', value };
+}
 
 export async function exportEpub({
   webpubDir,
@@ -263,7 +338,7 @@ export async function exportEpub({
   }
 
   const contextDir = upath.join(tmpDir, 'EPUB');
-  type XhtmlEntry = Resolved<ReturnType<typeof transpileHtmlToXhtml>>;
+  type XhtmlEntry = Awaited<ReturnType<typeof transpileHtmlToXhtml>>;
   const processHtml = async (target: string) => {
     let parseResult: XhtmlEntry;
     try {
@@ -302,21 +377,29 @@ export async function exportEpub({
   }
 
   // Process ToC document
-  const { document: entryDocument } = processResult[tocHtml].dom.window;
+  const tocTree = processResult[tocHtml].tree;
   const docLanguages = [manifest.inLanguage]
     .flat()
     .filter((v): v is string => Boolean(v));
   if (docLanguages.length === 0) {
-    docLanguages.push(entryDocument.documentElement.lang || 'en');
+    const htmlEl = findElement(tocTree, (n) => n.tagName === 'html');
+    const lang =
+      (htmlEl?.properties?.lang as string) ||
+      (htmlEl?.properties?.xmlLang as string) ||
+      'en';
+    docLanguages.push(lang);
   }
   const docTitle =
     normalizeLocalizableString(manifest.name, docLanguages) ||
-    entryDocument.title;
+    (() => {
+      const titleEl = findElement(tocTree, (n) => n.tagName === 'title');
+      return titleEl ? getTextContent(titleEl) : undefined;
+    })();
   if (!docTitle) {
     throw new Error('EPUB must have a title of one or more characters');
   }
   const { tocResourceTree } = await processTocDocument({
-    dom: processResult[tocHtml].dom,
+    tree: processResult[tocHtml].tree,
     target: tocHtml,
     contextDir,
     readingOrder,
@@ -328,7 +411,7 @@ export async function exportEpub({
   const pageListHtml = pageListResource?.url || entryHtmlRelPath;
   if (pageListHtml && pageListHtml in processResult) {
     await processPagelistDocument({
-      dom: processResult[pageListHtml].dom,
+      tree: processResult[pageListHtml].tree,
       target: pageListHtml,
       contextDir,
     });
@@ -368,8 +451,8 @@ export async function exportEpub({
   await compressEpub({ target, sourceDir: tmpDir });
 }
 
-async function writeAsXhtml(dom: JSDOM, absPath: string) {
-  const xhtml = `${XML_DECLARATION}\n${serializeToXml(dom.window.document)}`;
+async function writeAsXhtml(tree: hast.Root, absPath: string) {
+  const xhtml = hastToXhtml(tree);
   await fs.promises.writeFile(changeExtname(absPath, '.xhtml'), xhtml, 'utf8');
 }
 
@@ -380,135 +463,197 @@ async function transpileHtmlToXhtml({
   target: string;
   contextDir: string;
 }): Promise<{
-  dom: JSDOM;
+  tree: hast.Root;
   hasMathmlContent: boolean;
   hasRemoteResources: boolean;
   hasScriptedContent: boolean;
   hasSvgContent: boolean;
 }> {
   const absPath = upath.join(contextDir, target);
-  const dom = await getJsdomFromUrlOrFile({ src: absPath });
-  const { document } = dom.window;
-  // `xmlns` will be supplied in later serialization process
-  document.documentElement.removeAttribute('xmlns');
-  document.documentElement.setAttribute('xmlns:epub', EPUB_NS);
+  const html = fs.readFileSync(absPath, 'utf8');
+  const tree = parseHtmlToHast(html);
 
-  document.querySelectorAll('a[href]').forEach((el) => {
-    const href = decodeURI(el.getAttribute('href')!);
-    el.setAttribute('href', getRelativeHref(href, target, target));
+  // Modify the <html> element: remove xmlns, add xmlns:epub
+  const htmlEl = findElement(tree, (n) => n.tagName === 'html');
+  if (htmlEl?.properties) {
+    delete htmlEl.properties.xmlns;
+    htmlEl.properties['xmlns:epub'] = EPUB_NS;
+  }
+
+  // Update all <a href="..."> elements
+  const anchors = findAllElements(
+    tree,
+    (n) => n.tagName === 'a' && n.properties?.href != null,
+  );
+  for (const el of anchors) {
+    const href = decodeURI(String(el.properties!.href));
+    el.properties!.href = getRelativeHref(href, target, target);
+  }
+
+  await writeAsXhtml(tree, absPath);
+  await fs.promises.unlink(absPath);
+
+  // Feature detection
+  let hasMathmlContent = false;
+  let hasRemoteResources = false;
+  let hasScriptedContent = false;
+  let hasSvgContent = false;
+
+  visit(tree, 'element', (node) => {
+    const tag = node.tagName;
+    if (tag === 'math') {
+      hasMathmlContent = true;
+    }
+    if (tag === 'svg') {
+      hasSvgContent = true;
+    }
+    if (tag === 'script' || tag === 'form') {
+      hasScriptedContent = true;
+    }
+    const src = node.properties?.src as string | undefined;
+    if (src && (src.startsWith('http://') || src.startsWith('https://'))) {
+      hasRemoteResources = true;
+    }
   });
 
-  await writeAsXhtml(dom, absPath);
-  await fs.promises.unlink(absPath);
   return {
-    dom,
-    // FIXME: Yes, I recognize this implementation is inadequate.
-    hasMathmlContent: !!document.querySelector('math'),
-    hasRemoteResources: !!document.querySelector(
-      '[src^="http://"], [src^="https://"]',
-    ),
-    hasScriptedContent: !!document.querySelector('script, form'),
-    hasSvgContent: !!document.querySelector('svg'),
+    tree,
+    hasMathmlContent,
+    hasRemoteResources,
+    hasScriptedContent,
+    hasSvgContent,
   };
 }
 
-function replaceWithNavElement(dom: JSDOM, el: Element) {
-  const nav = dom.window.document.createElement('nav');
-  while (el.firstChild) {
-    nav.appendChild(el.firstChild);
-  }
-  for (let i = 0; i < el.attributes.length; i++) {
-    nav.attributes.setNamedItem(el.attributes[i].cloneNode() as Attr);
-  }
-  el.parentNode?.replaceChild(nav, el);
-  return nav;
+function replaceWithNavElement(el: hast.Element): hast.Element {
+  el.tagName = 'nav';
+  return el;
 }
 
 async function processTocDocument({
-  dom,
+  tree,
   target,
   contextDir,
   readingOrder,
   docLanguages,
   landmarks,
 }: {
-  dom: JSDOM;
+  tree: hast.Root;
   target: string;
   contextDir: string;
   readingOrder: PublicationLinks[];
   docLanguages: string[];
   landmarks: LandmarkEntry[];
 }): Promise<{ tocResourceTree: TocResourceTreeRoot | null }> {
-  const { document } = dom.window;
+  // Check for existing nav[epub:type] element
+  // In hast, rehype may store `epub:type` as either `epubType` (camelCase) or
+  // as a literal `epub:type` key depending on the parser. Check both.
+  const existingNavEpub = findElement(
+    tree,
+    (n) =>
+      n.tagName === 'nav' &&
+      (n.properties?.['epubType'] != null ||
+        n.properties?.['epub:type'] != null),
+  );
 
   let tocResourceTree: TocResourceTreeRoot | null = null;
-  if (!document.querySelector('nav[epub:type]')) {
-    tocResourceTree = parseTocDocument(dom);
+  if (!existingNavEpub) {
+    tocResourceTree = parseTocDocument(tree);
     if (tocResourceTree) {
-      const nav = replaceWithNavElement(dom, tocResourceTree.element);
-      nav.setAttribute('id', TOC_ID);
-      nav.setAttribute('epub:type', 'toc');
+      const nav = replaceWithNavElement(tocResourceTree.element);
+      nav.properties = nav.properties || {};
+      nav.properties.id = TOC_ID;
+      nav.properties['epub:type'] = 'toc';
     } else {
       Logger.debug(`Generating toc nav element: ${target}`);
 
-      const nav = document.createElement('nav');
-      nav.setAttribute('id', TOC_ID);
-      nav.setAttribute('role', 'doc-toc');
-      nav.setAttribute('epub:type', 'toc');
-      nav.setAttribute('hidden', '');
-      const h2 = document.createElement('h2');
-      h2.textContent = TOC_TITLE;
-      nav.appendChild(h2);
-      const ol = document.createElement('ol');
+      const olChildren: hast.ElementContent[] = [];
       tocResourceTree = {
-        element: nav,
+        element: null!,
         children: [],
       };
 
       for (const content of readingOrder) {
         let name = normalizeLocalizableString(content.name, docLanguages);
         if (!name) {
-          const dom = await getJsdomFromUrlOrFile({
-            src: upath.join(contextDir, changeExtname(content.url, '.xhtml')),
-          });
-          name = dom.window.document.title;
+          const xhtmlPath = upath.join(
+            contextDir,
+            changeExtname(content.url, '.xhtml'),
+          );
+          const xhtmlContent = fs.readFileSync(xhtmlPath, 'utf8');
+          const xhtmlTree = parseHtmlToHast(xhtmlContent);
+          const titleEl = findElement(xhtmlTree, (n) => n.tagName === 'title');
+          name = titleEl ? getTextContent(titleEl) : '';
         }
-        const li = document.createElement('li');
-        const a = document.createElement('a');
-        a.textContent = name;
-        a.href = getRelativeHref(content.url, '', target);
-        li.appendChild(a);
-        ol.appendChild(li);
-        tocResourceTree.children.push({ element: li, label: a });
+        const a = h('a', { href: getRelativeHref(content.url, '', target) }, [
+          text(name),
+        ]);
+        const li = h('li', {}, [a]);
+        olChildren.push(li);
+        tocResourceTree.children.push({
+          element: li,
+          label: a,
+        });
       }
 
-      nav.appendChild(ol);
-      document.body.appendChild(nav);
-      Logger.debug('Generated toc nav element', nav.outerHTML);
+      const ol = h('ol', {}, olChildren);
+      const nav = h(
+        'nav',
+        {
+          id: TOC_ID,
+          role: 'doc-toc',
+          'epub:type': 'toc',
+          hidden: '',
+        },
+        [h('h2', {}, [text(TOC_TITLE)]), ol],
+      );
+      tocResourceTree.element = nav;
+
+      // Append nav to body
+      const body = findElement(tree, (n) => n.tagName === 'body');
+      if (body) {
+        body.children.push(nav);
+      }
+      Logger.debug(
+        'Generated toc nav element',
+        toHtml(nav, { allowDangerousHtml: true }),
+      );
     }
 
     if (landmarks.length > 0) {
       Logger.debug(`Generating landmark nav element: ${target}`);
-      const nav = document.createElement('nav');
-      nav.setAttribute('epub:type', 'landmarks');
-      nav.setAttribute('id', LANDMARKS_ID);
-      nav.setAttribute('hidden', '');
-      const h2 = document.createElement('h2');
-      h2.textContent = EPUB_LANDMARKS_TITLE;
-      nav.appendChild(h2);
-      const ol = document.createElement('ol');
-      for (const { type, href, text } of landmarks) {
-        const li = document.createElement('li');
-        const a = document.createElement('a');
-        a.setAttribute('epub:type', type);
-        a.setAttribute('href', getRelativeHref(href, '', target));
-        a.text = text;
-        li.appendChild(a);
-        ol.appendChild(li);
+      const olChildren: hast.ElementContent[] = [];
+      for (const { type, href, text: entryText } of landmarks) {
+        const a = h(
+          'a',
+          {
+            'epub:type': type,
+            href: getRelativeHref(href, '', target),
+          },
+          [text(entryText)],
+        );
+        const li = h('li', {}, [a]);
+        olChildren.push(li);
       }
-      nav.appendChild(ol);
-      document.body.appendChild(nav);
-      Logger.debug('Generated landmark nav element', nav.outerHTML);
+      const ol = h('ol', {}, olChildren);
+      const nav = h(
+        'nav',
+        {
+          'epub:type': 'landmarks',
+          id: LANDMARKS_ID,
+          hidden: '',
+        },
+        [h('h2', {}, [text(EPUB_LANDMARKS_TITLE)]), ol],
+      );
+
+      const body = findElement(tree, (n) => n.tagName === 'body');
+      if (body) {
+        body.children.push(nav);
+      }
+      Logger.debug(
+        'Generated landmark nav element',
+        toHtml(nav, { allowDangerousHtml: true }),
+      );
     }
   }
 
@@ -516,43 +661,65 @@ async function processTocDocument({
   // When converting to EPUB, HTML files are converted to XHTML files
   // and no longer conform to Web publication, so we need to
   // explicitly remove the publication manifest.
-  const publicationLinkEl = document.querySelector(
-    'link[href][rel="publication"]',
+  const publicationLinkEl = findElement(
+    tree,
+    (n) =>
+      n.tagName === 'link' &&
+      n.properties?.href != null &&
+      [n.properties?.rel].flat().includes('publication'),
   );
   if (publicationLinkEl) {
-    const href = publicationLinkEl.getAttribute('href')!.trim();
+    const href = String(publicationLinkEl.properties!.href).trim();
     if (href.startsWith('#')) {
-      const scriptEl = document.getElementById(href.slice(1));
-      if (scriptEl?.getAttribute('type') === 'application/ld+json') {
-        scriptEl.parentNode?.removeChild(scriptEl);
-      }
+      const scriptId = href.slice(1);
+      // Find the script element by id and remove it
+      visit(tree, 'element', (node, index, parent) => {
+        if (
+          node.properties?.id === scriptId &&
+          node.properties?.type === 'application/ld+json'
+        ) {
+          if (parent && typeof index === 'number') {
+            parent.children.splice(index, 1);
+          }
+          return EXIT;
+        }
+      });
     }
-    publicationLinkEl.parentNode?.removeChild(publicationLinkEl);
+    // Remove the publication link element
+    visit(tree, 'element', (node, index, parent) => {
+      if (node === publicationLinkEl) {
+        if (parent && typeof index === 'number') {
+          parent.children.splice(index, 1);
+        }
+        return EXIT;
+      }
+    });
   }
 
   const absPath = upath.join(contextDir, target);
-  await writeAsXhtml(dom, absPath);
+  await writeAsXhtml(tree, absPath);
   return { tocResourceTree };
 }
 
 async function processPagelistDocument({
-  dom,
+  tree,
   target,
   contextDir,
 }: {
-  dom: JSDOM;
+  tree: hast.Root;
   target: string;
   contextDir: string;
 }): Promise<{ pageListResourceTree: PageListResourceTreeRoot | null }> {
-  const pageListResourceTree = parsePageListDocument(dom);
+  const pageListResourceTree = parsePageListDocument(tree);
   if (pageListResourceTree) {
-    const nav = replaceWithNavElement(dom, pageListResourceTree.element);
-    nav.setAttribute('id', PAGELIST_ID);
-    nav.setAttribute('epub:type', 'page-list');
+    const nav = replaceWithNavElement(pageListResourceTree.element);
+    nav.properties = nav.properties || {};
+    nav.properties.id = PAGELIST_ID;
+    nav.properties['epub:type'] = 'page-list';
   }
 
   const absPath = upath.join(contextDir, target);
-  await writeAsXhtml(dom, absPath);
+  await writeAsXhtml(tree, absPath);
   return { pageListResourceTree };
 }
 

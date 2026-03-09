@@ -1,12 +1,10 @@
-import jsdom, {
-  type AbortablePromise,
-  ResourceLoader as BaseResourceLoader,
-  JSDOM,
-  VirtualConsole,
-} from '@vivliostyle/jsdom';
-import DOMPurify, { type WindowLike } from 'dompurify';
+import type * as hast from 'hast';
 import { toHtml } from 'hast-util-to-html';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { h } from 'hastscript';
+import type { Raw } from 'mdast-util-to-hast';
+import fs from 'node:fs';
+import rehype from 'rehype';
+import { visit, EXIT } from 'unist-util-visit';
 import upath from 'upath';
 import MIMEType from 'whatwg-mimetype';
 import type { ManuscriptEntry } from '../config/resolve.js';
@@ -20,64 +18,170 @@ import type { PublicationManifest } from '../schema/publication.schema.js';
 import {
   DetailError,
   assertPubManifestSchema,
-  isValidUri,
   writeFileIfChanged,
 } from '../util.js';
 
-export const createVirtualConsole = (onError: (error: DetailError) => void) => {
-  const virtualConsole = new jsdom.VirtualConsole();
-  /* v8 ignore start */
-  virtualConsole.on('error', (message) => {
-    Logger.debug('[JSDOM Console] error:', message);
+// ---------------------------------------------------------------------------
+// Helpers for working with hast trees
+// ---------------------------------------------------------------------------
+
+/** Parse an HTML string into a hast Root using rehype. */
+function parseHtml(html: string): hast.Root {
+  return rehype()
+    .data('settings', { fragment: false })
+    .parse(html) as unknown as hast.Root;
+}
+
+/** Extract the concatenated text content from a hast node. */
+function textContent(node: hast.Root | hast.Element): string {
+  let text = '';
+  visit(node, 'text', (t) => {
+    text += t.value;
   });
-  virtualConsole.on('warn', (message) => {
-    Logger.debug('[JSDOM Console] warn:', message);
-  });
-  virtualConsole.on('log', (message) => {
-    Logger.debug('[JSDOM Console] log:', message);
-  });
-  virtualConsole.on('info', (message) => {
-    Logger.debug('[JSDOM Console] info:', message);
-  });
-  virtualConsole.on('dir', (message) => {
-    Logger.debug('[JSDOM Console] dir:', message);
-  });
-  virtualConsole.on('jsdomError', (error) => {
-    // Most of CSS using Paged media will be failed to run CSS parser of JSDOM.
-    // We just ignore it because we don't use CSS parse results.
-    // https://github.com/jsdom/jsdom/blob/a39e0ec4ce9a8806692d986a7ed0cd565ec7498a/lib/jsdom/living/helpers/stylesheets.js#L33-L44
-    // see also: https://github.com/jsdom/jsdom/issues/2005
-    if (error.message === 'Could not parse CSS stylesheet') {
-      return;
+  return text;
+}
+
+/**
+ * Simple sanitizer replacing DOMPurify: strips `javascript:` hrefs and
+ * removes event-handler properties from elements.
+ */
+function sanitizeTree(tree: hast.Root | hast.Element): void {
+  visit(tree, 'element', (node) => {
+    if (!node.properties) return;
+    // Strip javascript: from href
+    if (
+      typeof node.properties.href === 'string' &&
+      /^\s*javascript:/i.test(node.properties.href)
+    ) {
+      delete node.properties.href;
     }
-    onError(
-      new DetailError(
-        'Error occurred when loading content',
-        error.stack ?? error.message,
-      ),
-    );
+    // Remove event handler attributes (on*)
+    for (const key of Object.keys(node.properties)) {
+      if (/^on[A-Z]/i.test(key)) {
+        delete node.properties[key];
+      }
+    }
   });
-  /* v8 ignore stop */
-  return virtualConsole;
-};
+}
 
-export const htmlPurify = DOMPurify(
-  // @ts-expect-error: jsdom.DOMWindow should have trustedTypes property
-  new JSDOM('').window as WindowLike,
-);
+/**
+ * Find the first element matching a predicate via depth-first visit.
+ * Returns the element or undefined.
+ */
+function findElement(
+  tree: hast.Root | hast.Element,
+  predicate: (node: hast.Element) => boolean,
+): hast.Element | undefined {
+  let found: hast.Element | undefined;
+  visit(tree, 'element', (node) => {
+    if (predicate(node)) {
+      found = node;
+      return EXIT;
+    }
+  });
+  return found;
+}
 
-export class ResourceLoader extends BaseResourceLoader {
+/**
+ * Find all elements matching a predicate.
+ */
+function findAllElements(
+  tree: hast.Root | hast.Element,
+  predicate: (node: hast.Element) => boolean,
+): hast.Element[] {
+  const results: hast.Element[] = [];
+  visit(tree, 'element', (node) => {
+    if (predicate(node)) {
+      results.push(node);
+    }
+  });
+  return results;
+}
+
+/**
+ * Find <head> element in a hast tree.
+ */
+function findHead(tree: hast.Root): hast.Element | undefined {
+  return findElement(tree, (n) => n.tagName === 'head');
+}
+
+// ---------------------------------------------------------------------------
+// ResourceFetcher — replaces the JSDOM-based ResourceLoader
+// ---------------------------------------------------------------------------
+
+export class ResourceFetcher {
   static dataUrlOrigin = 'http://localhost/' as const;
 
-  fetcherMap = new Map<string, jsdom.AbortablePromise<Buffer>>();
+  fetcherMap = new Map<
+    string,
+    Promise<{ buffer: Buffer; contentType?: string }>
+  >();
 
-  fetch(url: string, options?: jsdom.FetchOptions) {
-    Logger.debug(`[JSDOM] Fetching resource: ${url}`);
-    const fetcher = super.fetch(url, options);
-    if (fetcher) {
-      this.fetcherMap.set(url, fetcher);
+  async fetch(url: string): Promise<Buffer | null> {
+    Logger.debug(`Fetching resource: ${url}`);
+    const fetchPromise = (async () => {
+      if (url.startsWith('file:')) {
+        const { fileURLToPath } = await import('node:url');
+        const filePath = fileURLToPath(url);
+        const buffer = fs.readFileSync(filePath);
+        const { default: mime } = await import('mime-types');
+        const contentType = mime.lookup(filePath) || undefined;
+        return { buffer, contentType };
+      }
+      const response = await globalThis.fetch(url);
+      const buffer = Buffer.from(await response.arrayBuffer());
+      const contentType = response.headers.get('content-type') ?? undefined;
+      return { buffer, contentType };
+    })();
+    this.fetcherMap.set(url, fetchPromise);
+    try {
+      const { buffer } = await fetchPromise;
+      return buffer;
+    } catch {
+      return null;
     }
-    return fetcher;
+  }
+
+  /**
+   * Discovers sub-resources in a parsed hast tree that would have been
+   * implicitly fetched by JSDOM's resource loader.
+   */
+  discoverSubResources(tree: hast.Root, baseUrl: string): string[] {
+    const urls: string[] = [];
+    visit(tree, 'element', (node) => {
+      // <link rel="stylesheet" href="...">
+      if (
+        node.tagName === 'link' &&
+        [node.properties?.rel].flat().includes('stylesheet') &&
+        node.properties?.href
+      ) {
+        urls.push(new URL(String(node.properties.href), baseUrl).href);
+      }
+      // <img src="...">
+      if (node.tagName === 'img' && node.properties?.src) {
+        urls.push(new URL(String(node.properties.src), baseUrl).href);
+      }
+      // <iframe src="..."> / <frame src="...">
+      if (
+        (node.tagName === 'iframe' || node.tagName === 'frame') &&
+        node.properties?.src
+      ) {
+        urls.push(new URL(String(node.properties.src), baseUrl).href);
+      }
+      // NOTE: <script src> is NOT fetched — equivalent to @vivliostyle/jsdom
+    });
+    return urls;
+  }
+
+  async fetchSubResources(tree: hast.Root, baseUrl: string): Promise<void> {
+    const urls = this.discoverSubResources(tree, baseUrl);
+    await Promise.allSettled(
+      urls.map((url) => {
+        if (!this.fetcherMap.has(url)) {
+          return this.fetch(url);
+        }
+      }),
+    );
   }
 
   static async saveFetchedResources({
@@ -86,13 +190,13 @@ export class ResourceLoader extends BaseResourceLoader {
     outputDir,
     onError,
   }: {
-    fetcherMap: Map<string, jsdom.AbortablePromise<Buffer>>;
+    fetcherMap: Map<string, Promise<{ buffer: Buffer; contentType?: string }>>;
     rootUrl: string;
     outputDir: string;
     onError?: (error: Error) => void;
   }) {
     const rootHref = rootUrl.startsWith('data:')
-      ? ResourceLoader.dataUrlOrigin
+      ? ResourceFetcher.dataUrlOrigin
       : /^https?:/i.test(rootUrl)
         ? new URL('/', rootUrl).href
         : new URL('.', rootUrl).href;
@@ -115,10 +219,9 @@ export class ResourceLoader extends BaseResourceLoader {
         }
         return (
           fetcher
-            .then(async (buffer) => {
+            .then(async ({ buffer, contentType }) => {
               let encodingFormat: string | undefined;
               try {
-                const contentType = fetcher.response?.headers['content-type'];
                 if (contentType) {
                   encodingFormat = new MIMEType(contentType).essence;
                 }
@@ -140,121 +243,74 @@ export class ResourceLoader extends BaseResourceLoader {
   }
 }
 
-export async function getJsdomFromUrlOrFile({
-  src,
-  resourceLoader,
-  virtualConsole = createVirtualConsole((error) => {
-    throw error;
-  }),
-}: {
-  src: string;
-  resourceLoader?: ResourceLoader;
-  virtualConsole?: VirtualConsole;
-}) {
-  const url = isValidUri(src) ? new URL(src) : pathToFileURL(src);
-  let dom: JSDOM;
-  if (url.protocol === 'http:' || url.protocol === 'https:') {
-    dom = await JSDOM.fromURL(src, {
-      virtualConsole,
-      resources: resourceLoader,
-    });
-  } else if (url.protocol === 'file:') {
-    if (resourceLoader) {
-      const file = resourceLoader._readFile(fileURLToPath(url));
-      resourceLoader.fetcherMap.set(url.href, file);
-    }
-    dom = await JSDOM.fromFile(fileURLToPath(url), {
-      virtualConsole,
-      resources: resourceLoader,
-      contentType:
-        src.endsWith('.xhtml') || src.endsWith('.xml')
-          ? 'application/xhtml+xml; charset=UTF-8'
-          : 'text/html; charset=UTF-8',
-    });
-  } else if (url.protocol === 'data:') {
-    const [head, body] = url.href.split(',', 2);
-    const data = decodeURIComponent(body);
-    const buffer = Buffer.from(
-      data,
-      /;base64$/i.test(head) ? 'base64' : 'utf8',
-    );
-    const dummyUrl = `${ResourceLoader.dataUrlOrigin}index.html`;
-    if (resourceLoader) {
-      let timeoutId: ReturnType<typeof setTimeout>;
-      const promise = new Promise((resolve) => {
-        timeoutId = setTimeout(resolve, 0, buffer);
-      }) as AbortablePromise<Buffer>;
-      promise.abort = () => {
-        if (timeoutId !== undefined) {
-          clearTimeout(timeoutId);
-        }
-      };
-      resourceLoader.fetcherMap.set(dummyUrl, promise);
-    }
-    dom = new JSDOM(buffer.toString(), {
-      virtualConsole,
-      resources: resourceLoader,
-      contentType: 'text/html; charset=UTF-8',
-      url: dummyUrl,
-    });
-  } else {
-    throw new Error(`Unsupported protocol: ${url.protocol}`);
-  }
-  return dom;
-}
-
-export function getJsdomFromString({
-  html,
-  contentType,
-  virtualConsole = createVirtualConsole((error) => {
-    throw error;
-  }),
-}: {
-  html: string;
-  contentType?: 'text/html' | 'application/xhtml+xml';
-  virtualConsole?: VirtualConsole;
-}) {
-  return new JSDOM(html, {
-    virtualConsole,
-    ...(contentType && { contentType }),
-  });
-}
+// ---------------------------------------------------------------------------
+// getStructuredSectionFromHtml — reads an HTML file, extracts heading structure
+// ---------------------------------------------------------------------------
 
 export async function getStructuredSectionFromHtml(
   htmlPath: string,
   href?: string,
 ) {
-  const dom = await getJsdomFromUrlOrFile({ src: htmlPath });
-  const { document } = dom.window;
-  const allHeadings = [...document.querySelectorAll('h1, h2, h3, h4, h5, h6')]
-    .filter((el) => {
-      // Exclude headings contained by blockquote
-      // TODO: Make customizable
-      return !el.matches('blockquote *');
-    })
-    .sort((a, b) => {
-      const position = a.compareDocumentPosition(b);
-      return position & 2 /* DOCUMENT_POSITION_PRECEDING */
-        ? 1
-        : position & 4 /* DOCUMENT_POSITION_FOLLOWING */
-          ? -1
-          : 0;
-    });
+  const html = fs.readFileSync(htmlPath, 'utf8');
+  const tree = parseHtml(html);
 
-  function traverse(headers: Element[]): StructuredDocumentSection[] {
+  // Collect headings, excluding those inside <blockquote>
+  const headingTagNames = new Set(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']);
+
+  const allHeadings: hast.Element[] = [];
+
+  // We need to track ancestors to exclude blockquote descendants.
+  // Use a recursive walker instead of visit() to track ancestors.
+  function walkForHeadings(
+    node: hast.Root | hast.Element,
+    insideBlockquote: boolean,
+  ): void {
+    if (node.type === 'element') {
+      if (node.tagName === 'blockquote') {
+        insideBlockquote = true;
+      }
+      if (headingTagNames.has(node.tagName) && !insideBlockquote) {
+        allHeadings.push(node);
+      }
+    }
+    if ('children' in node) {
+      for (const child of node.children) {
+        if (child.type === 'element') {
+          walkForHeadings(child, insideBlockquote);
+        }
+      }
+    }
+  }
+  walkForHeadings(tree, false);
+
+  // visit() traverses in document order, so no sorting needed
+
+  function traverse(headers: hast.Element[]): StructuredDocumentSection[] {
     if (headers.length === 0) {
       return [];
     }
     const [head, ...tail] = headers;
-    const section = head.parentElement!;
-    const id = head.id || section.id;
+    // Get the section (parent) element for id lookup
+    const parentId = findParentId(tree, head);
+    const headId =
+      head.properties?.id != null ? String(head.properties.id) : undefined;
+    const id = headId || parentId;
     const level = Number(head.tagName.slice(1));
+
+    // Sanitize heading inner HTML
+    const headingClone: hast.Element = JSON.parse(JSON.stringify(head));
+    sanitizeTree(headingClone);
+    const headingHtml = toHtml(headingClone.children, {
+      allowDangerousHtml: true,
+    });
+    const headingText = textContent(head).trim().replace(/\s+/g, ' ') || '';
+
     let i = tail.findIndex((s) => Number(s.tagName.slice(1)) <= level);
     i = i === -1 ? tail.length : i;
     return [
       {
-        headingHtml: htmlPurify.sanitize(head.innerHTML),
-        headingText: head.textContent?.trim().replace(/\s+/g, ' ') || '',
+        headingHtml,
+        headingText,
         level,
         ...(href && id && { href: `${href}#${encodeURIComponent(id)}` }),
         ...(id && { id }),
@@ -265,6 +321,42 @@ export async function getStructuredSectionFromHtml(
   }
   return traverse(allHeadings);
 }
+
+/**
+ * Walk the tree to find the parent element of `target` and return its id.
+ */
+function findParentId(
+  tree: hast.Root,
+  target: hast.Element,
+): string | undefined {
+  function search(
+    node: hast.Root | hast.Element,
+    parent?: hast.Element,
+  ): string | undefined {
+    if (node === target) {
+      return parent?.properties?.id != null
+        ? String(parent.properties.id)
+        : undefined;
+    }
+    if ('children' in node) {
+      for (const child of node.children) {
+        if (child.type === 'element') {
+          const result = search(
+            child,
+            node.type === 'element' ? (node as hast.Element) : parent,
+          );
+          if (result !== undefined) return result;
+        }
+      }
+    }
+    return undefined;
+  }
+  return search(tree);
+}
+
+// ---------------------------------------------------------------------------
+// TOC style
+// ---------------------------------------------------------------------------
 
 const getTocHtmlStyle = ({
   pageBreakBefore,
@@ -296,64 +388,55 @@ ${
 `;
 };
 
-type HastElement = import('hast').ElementContent | import('hast').Root;
+// ---------------------------------------------------------------------------
+// JSX-based helpers (unchanged — these use hastscript@9 / hast@3 via JSX)
+// ---------------------------------------------------------------------------
+
+type HastElement = hast.ElementContent | hast.Root;
 
 export const defaultTocTransform = {
   transformDocumentList:
     (nodeList: StructuredDocument[]) =>
     (propsList: { children: HastElement | HastElement[] }[]): HastElement => {
-      return (
-        <ol>
-          {nodeList
-            .map((a, i) => [a, propsList[i]] as const)
-            .flatMap(
-              ([{ href, title, sections }, { children, ...otherProps }]) => {
-                // don't display the document title if it has only one top-level H1 heading
-                if (sections?.length === 1 && sections[0].level === 1) {
-                  return [children].flat().flatMap((e) => {
-                    if (e.type === 'element' && e.tagName === 'ol') {
-                      return e.children;
-                    }
-                    return e;
-                  });
+      return h(
+        'ol',
+        nodeList
+          .map((a, i) => [a, propsList[i]] as const)
+          .flatMap(([{ href, title, sections }, { children }]) => {
+            // don't display the document title if it has only one top-level H1 heading
+            if (sections?.length === 1 && sections[0].level === 1) {
+              return [children].flat().flatMap((e) => {
+                if (e.type === 'element' && e.tagName === 'ol') {
+                  return e.children;
                 }
-                return (
-                  <li {...otherProps}>
-                    <a {...{ href }}>{title}</a>
-                    {children}
-                  </li>
-                );
-              },
-            )}
-        </ol>
+                return e;
+              });
+            }
+            return h('li', h('a', { href }, title), children);
+          }),
       );
     },
   transformSectionList:
     (nodeList: StructuredDocumentSection[]) =>
     (propsList: { children: HastElement | HastElement[] }[]): HastElement => {
-      return (
-        <ol>
-          {nodeList
-            .map((a, i) => [a, propsList[i]] as const)
-            .map(
-              ([{ headingHtml, href, level }, { children, ...otherProps }]) => {
-                const headingContent = {
-                  type: 'raw',
-                  value: headingHtml,
-                };
-                return (
-                  <li {...otherProps} data-section-level={level}>
-                    {href ? (
-                      <a {...{ href }}>{headingContent}</a>
-                    ) : (
-                      <span>{headingContent}</span>
-                    )}
-                    {children}
-                  </li>
-                );
-              },
-            )}
-        </ol>
+      return h(
+        'ol',
+        nodeList
+          .map((a, i) => [a, propsList[i]] as const)
+          .map(([{ headingHtml, href, level }, { children }]) => {
+            const headingContent: Raw = {
+              type: 'raw',
+              value: headingHtml,
+            };
+            return h(
+              'li',
+              { 'data-section-level': level },
+              href
+                ? h('a', { href }, headingContent)
+                : h('span', headingContent),
+              children,
+            );
+          }),
       );
     },
 };
@@ -441,8 +524,12 @@ export async function generateTocListSection({
   return toHtml(docToc, { allowDangerousHtml: true });
 }
 
+// ---------------------------------------------------------------------------
+// processTocHtml — now operates on hast Root instead of JSDOM
+// ---------------------------------------------------------------------------
+
 export async function processTocHtml(
-  dom: JSDOM,
+  tree: hast.Root,
   {
     manifestPath,
     tocTitle,
@@ -456,44 +543,89 @@ export async function processTocHtml(
     tocTitle: string;
     styleOptions?: Parameters<typeof getTocHtmlStyle>[0];
   },
-): Promise<JSDOM> {
-  const { document } = dom.window;
-  if (
-    !document.querySelector(
-      'link[rel="publication"][type="application/ld+json"]',
-    )
-  ) {
-    const l = document.createElement('link');
-    l.setAttribute('rel', 'publication');
-    l.setAttribute('type', 'application/ld+json');
-    l.setAttribute('href', encodeURI(upath.relative(distDir, manifestPath)));
-    document.head.appendChild(l);
-  }
-
-  const style = document.querySelector('style[data-vv-style]');
-  if (style) {
-    const textContent = getTocHtmlStyle(styleOptions);
-    if (textContent) {
-      style.textContent = textContent;
-    } else {
-      style.remove();
+): Promise<hast.Root> {
+  // Ensure a <link rel="publication" ...> exists in <head>
+  const existingPubLink = findElement(
+    tree,
+    (n) =>
+      n.tagName === 'link' &&
+      [n.properties?.rel].flat().includes('publication') &&
+      n.properties?.type === 'application/ld+json',
+  );
+  if (!existingPubLink) {
+    const head = findHead(tree);
+    if (head) {
+      head.children.push({
+        type: 'element',
+        tagName: 'link',
+        properties: {
+          rel: 'publication',
+          type: 'application/ld+json',
+          href: encodeURI(upath.relative(distDir, manifestPath)),
+        },
+        children: [],
+      });
     }
   }
 
-  const nav = document.querySelector('nav, [role="doc-toc"]');
-  if (nav && !nav.hasChildNodes()) {
-    const h2 = document.createElement('h2');
-    h2.textContent = tocTitle;
-    nav.appendChild(h2);
-    nav.innerHTML += await generateTocListSection({
+  // Handle <style data-vv-style>
+  const styleEl = findElement(
+    tree,
+    (n) => n.tagName === 'style' && n.properties?.dataVvStyle !== undefined,
+  );
+  if (styleEl) {
+    const styleText = getTocHtmlStyle(styleOptions);
+    if (styleText) {
+      styleEl.children = [{ type: 'text', value: styleText }];
+    } else {
+      // Remove the style element from its parent
+      removeElement(tree, styleEl);
+    }
+  }
+
+  // Find <nav> or [role="doc-toc"]
+  const nav = findElement(
+    tree,
+    (n) => n.tagName === 'nav' || n.properties?.role === 'doc-toc',
+  );
+  if (
+    nav &&
+    nav.children.filter((c) => c.type !== 'text' || c.value.trim()).length === 0
+  ) {
+    // Nav is empty — populate it
+    const h2: hast.Element = {
+      type: 'element',
+      tagName: 'h2',
+      properties: {},
+      children: [{ type: 'text', value: tocTitle }],
+    };
+    nav.children.push(h2);
+
+    const tocHtmlString = await generateTocListSection({
       entries,
       distDir,
       sectionDepth,
       transform,
     });
+    const tocTree = parseHtml(tocHtmlString);
+    // Extract the body content from the parsed fragment
+    const body = findElement(tocTree, (n) => n.tagName === 'body');
+    if (body) {
+      nav.children.push(...body.children);
+    } else {
+      for (const c of tocTree.children) {
+        if (c.type !== 'doctype') {
+          nav.children.push(c);
+        }
+      }
+    }
   }
-  return dom;
+  return tree;
 }
+
+// ---------------------------------------------------------------------------
+// Cover HTML
+// ---------------------------------------------------------------------------
 
 const getCoverHtmlStyle = ({
   pageBreakBefore,
@@ -545,8 +677,12 @@ export function generateDefaultCoverHtml({
   return toHtml(toc);
 }
 
+// ---------------------------------------------------------------------------
+// processCoverHtml — now operates on hast Root instead of JSDOM
+// ---------------------------------------------------------------------------
+
 export async function processCoverHtml(
-  dom: JSDOM,
+  tree: hast.Root,
   {
     imageSrc,
     imageAlt,
@@ -556,98 +692,78 @@ export async function processCoverHtml(
     imageAlt: string;
     styleOptions?: Parameters<typeof getCoverHtmlStyle>[0];
   },
-): Promise<JSDOM> {
-  const { document } = dom.window;
-  const style = document.querySelector('style[data-vv-style]');
-  if (style) {
-    const textContent = getCoverHtmlStyle(styleOptions);
-    if (textContent) {
-      style.textContent = textContent;
+): Promise<hast.Root> {
+  // Handle <style data-vv-style>
+  const styleEl = findElement(
+    tree,
+    (n) => n.tagName === 'style' && n.properties?.dataVvStyle !== undefined,
+  );
+  if (styleEl) {
+    const styleText = getCoverHtmlStyle(styleOptions);
+    if (styleText) {
+      styleEl.children = [{ type: 'text', value: styleText }];
     } else {
-      style.remove();
+      removeElement(tree, styleEl);
     }
   }
 
-  const cover = document.querySelector('img[role="doc-cover"]');
-  if (cover && !cover.hasAttribute('src')) {
-    cover.setAttribute('src', encodeURI(imageSrc));
+  // Find <img role="doc-cover">
+  const cover = findElement(
+    tree,
+    (n) => n.tagName === 'img' && n.properties?.role === 'doc-cover',
+  );
+  if (cover) {
+    if (!cover.properties?.src) {
+      cover.properties = cover.properties || {};
+      cover.properties.src = encodeURI(imageSrc);
+    }
+    if (!cover.properties?.alt) {
+      cover.properties = cover.properties || {};
+      cover.properties.alt = imageAlt;
+    }
   }
-  if (cover && !cover.hasAttribute('alt')) {
-    cover.setAttribute('alt', imageAlt);
-  }
-  return dom;
+  return tree;
 }
 
-export async function processManuscriptHtml(
-  dom: JSDOM,
-  {
-    title,
-    style,
-    contentType,
-    language,
-  }: {
-    title?: string;
-    style?: string[];
-    contentType?: 'text/html' | 'application/xhtml+xml';
-    language?: string | null;
-  },
-): Promise<JSDOM> {
-  const { document } = dom.window;
-  if (title) {
-    if (!document.querySelector('title')) {
-      const t = document.createElement('title');
-      document.head.appendChild(t);
-    }
-    document.title = title;
-  }
-  for (const s of style ?? []) {
-    const l = document.createElement('link');
-    l.setAttribute('rel', 'stylesheet');
-    l.setAttribute('type', 'text/css');
-    l.setAttribute('href', encodeURI(s));
-    document.head.appendChild(l);
-  }
-  if (language) {
-    if (contentType === 'application/xhtml+xml') {
-      if (!document.documentElement.getAttribute('xml:lang')) {
-        document.documentElement.setAttribute('lang', language);
-        document.documentElement.setAttribute('xml:lang', language);
-      }
-    } else {
-      if (!document.documentElement.getAttribute('lang')) {
-        document.documentElement.setAttribute('lang', language);
-      }
-    }
-  }
-  return dom;
-}
+// ---------------------------------------------------------------------------
+// fetchLinkedPublicationManifest — now operates on hast Root
+// ---------------------------------------------------------------------------
 
 export async function fetchLinkedPublicationManifest({
-  dom,
-  resourceLoader,
+  tree,
+  resourceFetcher,
   baseUrl,
 }: {
-  dom: JSDOM;
-  resourceLoader: ResourceLoader;
+  tree: hast.Root;
+  resourceFetcher: ResourceFetcher;
   baseUrl: string;
 }): Promise<{ manifest: PublicationManifest; manifestUrl: string } | null> {
-  const { document } = dom.window;
-
-  const linkEl = document.querySelector('link[href][rel="publication"]');
+  const linkEl = findElement(
+    tree,
+    (n) =>
+      n.tagName === 'link' &&
+      n.properties?.href != null &&
+      [n.properties?.rel].flat().includes('publication'),
+  );
   if (!linkEl) {
     return null;
   }
-  const href = linkEl.getAttribute('href')!.trim();
+  const href = String(linkEl.properties!.href).trim();
   let manifest: PublicationManifest;
   let manifestUrl = baseUrl;
   if (href.startsWith('#')) {
-    const scriptEl = document.getElementById(href.slice(1));
-    if (scriptEl?.getAttribute('type') !== 'application/ld+json') {
+    const id = href.slice(1);
+    const scriptEl = findElement(
+      tree,
+      (n) =>
+        n.properties?.id === id && n.properties?.type === 'application/ld+json',
+    );
+    if (!scriptEl) {
       return null;
     }
     Logger.debug(`Found embedded publication manifest: ${href}`);
     try {
-      manifest = JSON.parse(scriptEl.innerHTML);
+      manifest = JSON.parse(toHtml(scriptEl.children));
     } catch (error) {
       const thrownError = error as Error;
       throw new DetailError(
@@ -659,7 +775,7 @@ export async function fetchLinkedPublicationManifest({
     Logger.debug(`Found linked publication manifest: ${href}`);
     const url = new URL(href, baseUrl);
     manifestUrl = url.href;
-    const buffer = await resourceLoader.fetch(url.href);
+    const buffer = await resourceFetcher.fetch(url.href);
     if (!buffer) {
       throw new Error(`Failed to fetch manifest JSON file: ${url.href}`);
     }
@@ -688,73 +804,92 @@ export async function fetchLinkedPublicationManifest({
   };
 }
 
+// ---------------------------------------------------------------------------
+// parseTocDocument / parsePageListDocument — now operate on hast Root
+// ---------------------------------------------------------------------------
+
 export type TocResourceTreeItem = {
-  element: HTMLElement;
-  label: HTMLElement;
+  element: hast.Element;
+  label: hast.Element;
   children?: TocResourceTreeItem[];
 };
 export type TocResourceTreeRoot = {
-  element: HTMLElement;
-  heading?: HTMLElement;
+  element: hast.Element;
+  heading?: hast.Element;
   children: TocResourceTreeItem[];
 };
 
-export function parseTocDocument(dom: JSDOM): TocResourceTreeRoot | null {
-  const { document } = dom.window;
-
-  const docTocEl = document.querySelectorAll('[role="doc-toc"]');
-  if (docTocEl.length === 0) {
+export function parseTocDocument(tree: hast.Root): TocResourceTreeRoot | null {
+  const docTocElements = findAllElements(
+    tree,
+    (n) => n.properties?.role === 'doc-toc',
+  );
+  if (docTocElements.length === 0) {
     return null;
   }
-  const tocRoot = docTocEl.item(0);
+  const tocRoot = docTocElements[0];
 
-  const parseTocItem = (element: Element): TocResourceTreeItem | null => {
-    if (element.tagName !== 'LI') {
+  const parseTocItem = (element: hast.Element): TocResourceTreeItem | null => {
+    if (element.tagName !== 'li') {
       return null;
     }
-    const label = element.children.item(0);
-    const ol = element.children.item(1);
-    if (!label || (label.tagName !== 'A' && label.tagName !== 'SPAN')) {
-      return null;
-    }
-    if (!ol || ol.tagName !== 'OL') {
-      return { element: element as HTMLElement, label: label as HTMLElement };
-    }
-    const children = Array.from(ol.children).reduce<
-      TocResourceTreeItem[] | null
-    >((acc, val) => {
-      if (!acc) {
-        return acc;
-      }
-      const res = parseTocItem(val);
-      return res && [...acc, res];
-    }, []);
-    return (
-      children && {
-        element: element as HTMLElement,
-        label: label as HTMLElement,
-        children,
-      }
+    const elementChildren = element.children.filter(
+      (c): c is hast.Element => c.type === 'element',
     );
-  };
-
-  let heading: HTMLElement | undefined;
-  for (let child of Array.from(tocRoot.children)) {
-    if (child.tagName === 'OL') {
-      const children = Array.from(child.children).reduce<
-        TocResourceTreeItem[] | null
-      >((acc, val) => {
+    const label = elementChildren[0];
+    const ol = elementChildren[1];
+    if (!label || (label.tagName !== 'a' && label.tagName !== 'span')) {
+      return null;
+    }
+    if (!ol || ol.tagName !== 'ol') {
+      return { element, label };
+    }
+    const olChildren = ol.children.filter(
+      (c): c is hast.Element => c.type === 'element',
+    );
+    const children = olChildren.reduce<TocResourceTreeItem[] | null>(
+      (acc, val) => {
         if (!acc) {
           return acc;
         }
         const res = parseTocItem(val);
         return res && [...acc, res];
-      }, []);
-      return children && { element: tocRoot as HTMLElement, heading, children };
+      },
+      [],
+    );
+    return (
+      children && {
+        element,
+        label,
+        children,
+      }
+    );
+  };
+
+  let heading: hast.Element | undefined;
+  const tocRootChildren = tocRoot.children.filter(
+    (c): c is hast.Element => c.type === 'element',
+  );
+  for (let child of tocRootChildren) {
+    if (child.tagName === 'ol') {
+      const olChildren = child.children.filter(
+        (c): c is hast.Element => c.type === 'element',
+      );
+      const children = olChildren.reduce<TocResourceTreeItem[] | null>(
+        (acc, val) => {
+          if (!acc) {
+            return acc;
+          }
+          const res = parseTocItem(val);
+          return res && [...acc, res];
+        },
+        [],
+      );
+      return children && { element: tocRoot, heading, children };
     } else if (
-      ['H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HGROUP'].includes(child.tagName)
+      ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hgroup'].includes(child.tagName)
     ) {
-      heading = child as HTMLElement;
+      heading = child;
     } else {
       return null;
     }
@@ -763,48 +898,69 @@ export function parseTocDocument(dom: JSDOM): TocResourceTreeRoot | null {
 }
 
 export type PageListResourceTreeItem = {
-  element: HTMLElement;
+  element: hast.Element;
 };
 export type PageListResourceTreeRoot = {
-  element: HTMLElement;
-  heading?: HTMLElement;
+  element: hast.Element;
+  heading?: hast.Element;
   children: PageListResourceTreeItem[];
 };
 
 export function parsePageListDocument(
-  dom: JSDOM,
+  tree: hast.Root,
 ): PageListResourceTreeRoot | null {
-  const { document } = dom.window;
-
-  const docPageListEl = document.querySelectorAll('[role="doc-pagelist"]');
-  if (docPageListEl.length === 0) {
+  const docPageListElements = findAllElements(
+    tree,
+    (n) => n.properties?.role === 'doc-pagelist',
+  );
+  if (docPageListElements.length === 0) {
     return null;
   }
-  const pageListRoot = docPageListEl.item(0);
+  const pageListRoot = docPageListElements[0];
 
-  let heading: HTMLElement | undefined;
-  for (let child of Array.from(pageListRoot.children)) {
-    if (child.tagName === 'OL') {
-      const children = Array.from(child.children).reduce<
-        PageListResourceTreeItem[] | null
-      >((acc, element) => {
-        return (
-          acc &&
-          (element.tagName === 'LI'
-            ? [...acc, { element: element as HTMLElement }]
-            : null)
-        );
-      }, []);
-      return (
-        children && { element: pageListRoot as HTMLElement, heading, children }
+  let heading: hast.Element | undefined;
+  const pageListChildren = pageListRoot.children.filter(
+    (c): c is hast.Element => c.type === 'element',
+  );
+  for (let child of pageListChildren) {
+    if (child.tagName === 'ol') {
+      const olChildren = child.children.filter(
+        (c): c is hast.Element => c.type === 'element',
       );
+      const children = olChildren.reduce<PageListResourceTreeItem[] | null>(
+        (acc, element) => {
+          return (
+            acc && (element.tagName === 'li' ? [...acc, { element }] : null)
+          );
+        },
+        [],
+      );
+      return children && { element: pageListRoot, heading, children };
     } else if (
-      ['H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HGROUP'].includes(child.tagName)
+      ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'hgroup'].includes(child.tagName)
     ) {
-      heading = child as HTMLElement;
+      heading = child;
     } else {
       return null;
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Internal helper: remove an element from its parent in the hast tree
+// ---------------------------------------------------------------------------
+
+function removeElement(tree: hast.Root, target: hast.Element): void {
+  visit(tree, 'element', (node, index, parent) => {
+    if (node === target && parent && index != null) {
+      parent.children.splice(index, 1);
+      return EXIT;
+    }
+  });
+  // Also check root children
+  const idx = tree.children.indexOf(target);
+  if (idx !== -1) {
+    tree.children.splice(idx, 1);
+  }
 }

@@ -20,7 +20,7 @@ exports[`generate webpub from a data URI input 1`] = `
 `;
 
 exports[`generate webpub from a data URI input 2`] = `
-"<!DOCTYPE html>
+"<!doctype html>
 <html lang=\\"en\\">
   <head>
     <meta charset=\\"UTF-8\\" />
@@ -68,7 +68,7 @@ Object {
 `;
 
 exports[`generate webpub from a plain HTML 3`] = `
-"<!DOCTYPE html>
+"<!doctype html>
 <html lang=\\"ja\\">
   <head>
     <link rel=\\"stylesheet\\" type=\\"text/css\\" href=\\"style.css\\" />

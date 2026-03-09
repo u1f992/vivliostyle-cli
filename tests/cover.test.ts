@@ -1,5 +1,4 @@
 import './mocks/fs.js';
-import './mocks/vivliostyle__jsdom.js';
 
 import { JSDOM } from '@vivliostyle/jsdom';
 import { vol } from 'memfs';

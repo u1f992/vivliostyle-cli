@@ -27,10 +27,7 @@ exports[`generate EPUB from series of HTML files > content.opf 1`] = `
 
 exports[`generate EPUB from series of HTML files > src/index.xhtml 1`] = `
 "<?xml version=\\"1.0\\" encoding=\\"UTF-8\\"?>
-<html
-  xmlns=\\"http://www.w3.org/1999/xhtml\\"
-  lang=\\"en\\"
-  xmlns:epub=\\"http://www.idpf.org/2007/ops\\"
+<html lang=\\"en\\" xmlns:epub=\\"http://www.idpf.org/2007/ops\\"
   ><head>
     <title>My book</title>
   </head>
@@ -139,10 +136,7 @@ exports[`generate EPUB from single HTML with pub manifest > content.opf 1`] = `
 
 exports[`generate EPUB from single HTML with pub manifest > index.xhtml 1`] = `
 "<?xml version=\\"1.0\\" encoding=\\"UTF-8\\"?>
-<html
-  xmlns=\\"http://www.w3.org/1999/xhtml\\"
-  lang=\\"ja-JP\\"
-  xmlns:epub=\\"http://www.idpf.org/2007/ops\\"
+<html lang=\\"ja-JP\\" xmlns:epub=\\"http://www.idpf.org/2007/ops\\"
   ><head>
     <title>Document</title>
     <link rel=\\"stylesheet\\" type=\\"text/css\\" href=\\"assets/style.css\\" />
@@ -169,9 +163,9 @@ exports[`generate EPUB from single HTML with pub manifest > index.xhtml 1`] = `
         <li><a href=\\"index.xhtml#main-2\\">Main 2</a></li>
       </ol>
     </nav>
-    <math xmlns=\\"http://www.w3.org/1998/Math/MathML\\" />
-    <svg xmlns=\\"http://www.w3.org/2000/svg\\" />
-    <script src=\\"https://example.com/remote-script.js\\"></script>
+    <math />
+    <svg />
+    <script src=\\"https://example.com/remote-script.js\\" />
 
     <nav epub:type=\\"landmarks\\" id=\\"landmarks\\" hidden=\\"\\"
       ><h2>Landmarks</h2
@@ -225,8 +219,8 @@ exports[`generate EPUB from single Markdown input > content.opf 1`] = `
 
 exports[`generate EPUB from single Markdown input > foo bar%.xhtml 1`] = `
 "<?xml version=\\"1.0\\" encoding=\\"UTF-8\\"?>
-<!DOCTYPE html><html xmlns=\\"http://www.w3.org/1999/xhtml\\" xmlns:epub=\\"http://www.idpf.org/2007/ops\\"><head>
-    <meta charset=\\"utf-8\\" />
+<!DOCTYPE html><html xmlns:epub=\\"http://www.idpf.org/2007/ops\\"><head>
+    <meta charSet=\\"utf-8\\" />
     <title>日本語</title>
     <meta name=\\"viewport\\" content=\\"width=device-width, initial-scale=1\\" />
   </head>
@@ -285,12 +279,9 @@ exports[`generate EPUB from vivliostyle.config.js > content.opf 1`] = `
 
 exports[`generate EPUB from vivliostyle.config.js > cover document%.xhtml 1`] = `
 "<?xml version=\\"1.0\\" encoding=\\"UTF-8\\"?>
-<html
-  xmlns=\\"http://www.w3.org/1999/xhtml\\"
-  xmlns:epub=\\"http://www.idpf.org/2007/ops\\"
+<html xmlns:epub=\\"http://www.idpf.org/2007/ops\\"
   ><head
-    ><meta charset=\\"utf-8\\" /><title></title
-    ><style data-vv-style=\\"\\">
+    ><meta charset=\\"utf-8\\" /><title /><style data-vv-style=\\"\\">
       body {
         margin: 0;
       }
@@ -316,9 +307,7 @@ exports[`generate EPUB from vivliostyle.config.js > cover document%.xhtml 1`] = 
 
 exports[`generate EPUB from vivliostyle.config.js > index file%.xhtml 1`] = `
 "<?xml version=\\"1.0\\" encoding=\\"UTF-8\\"?>
-<html
-  xmlns=\\"http://www.w3.org/1999/xhtml\\"
-  xmlns:epub=\\"http://www.idpf.org/2007/ops\\"
+<html xmlns:epub=\\"http://www.idpf.org/2007/ops\\"
   ><head
     ><meta charset=\\"utf-8\\" /><title>日本語</title
     ><link

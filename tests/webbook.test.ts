@@ -1,6 +1,6 @@
 import './mocks/fs.js';
 import './mocks/tmp.js';
-import './mocks/vivliostyle__jsdom.js';
+import './mocks/fetch.js';
 
 import { vol } from 'memfs';
 import { format } from 'prettier';
