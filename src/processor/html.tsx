@@ -107,6 +107,26 @@ function findHead(tree: hast.Root): hast.Element | undefined {
 
 // ---------------------------------------------------------------------------
 // ResourceFetcher — replaces the JSDOM-based ResourceLoader
+//
+// @vivliostyle/jsdom resource-loader.js:71 fetch() handles http(s), file,
+// and data URL schemes. This class replaces that with globalThis.fetch for
+// http(s) and fs.readFileSync for file: URLs.
+//
+// Sub-resource discovery (discoverSubResources) replaces the implicit
+// fetching that JSDOM performs during HTML parsing. The following elements
+// are covered, matching JSDOM's behavior:
+//
+//   <link rel="stylesheet"> — HTMLLinkElement-impl.js:95 fetchStylesheet()
+//   <img src>               — HTMLImageElement-impl.js:117 resourceLoader.fetch()
+//   <frame>/<iframe> src    — HTMLFrameElement-impl.js:92 resourceLoader.fetch()
+//
+// NOT fetched (matching JSDOM when runScripts is not "dangerously"):
+//   <script src>            — HTMLScriptElement-impl.js:53 _canRunScript()
+//
+// NOT YET IMPLEMENTED:
+//   CSS @import (recursive)  — stylesheets.js:95 scanForImportRules()
+//   JSDOM recursively fetches @import rules from loaded stylesheets.
+//   This is not yet replicated here.
 // ---------------------------------------------------------------------------
 
 export class ResourceFetcher {
@@ -117,9 +137,11 @@ export class ResourceFetcher {
     Promise<{ buffer: Buffer; contentType?: string }>
   >();
 
+  // resource-loader.js:71 fetch() — protocol dispatch
   async fetch(url: string): Promise<Buffer | null> {
     Logger.debug(`Fetching resource: ${url}`);
     const fetchPromise = (async () => {
+      // resource-loader.js:119 case "file" — fs read
       if (url.startsWith('file:')) {
         const { fileURLToPath } = await import('node:url');
         const filePath = fileURLToPath(url);
@@ -128,6 +150,7 @@ export class ResourceFetcher {
         const contentType = mime.lookup(filePath) || undefined;
         return { buffer, contentType };
       }
+      // resource-loader.js:82 case "http"/"https" — network fetch
       const response = await globalThis.fetch(url);
       const buffer = Buffer.from(await response.arrayBuffer());
       const contentType = response.headers.get('content-type') ?? undefined;
@@ -144,12 +167,13 @@ export class ResourceFetcher {
 
   /**
    * Discovers sub-resources in a parsed hast tree that would have been
-   * implicitly fetched by JSDOM's resource loader.
+   * implicitly fetched by JSDOM's resource loader during HTML parsing.
    */
   discoverSubResources(tree: hast.Root, baseUrl: string): string[] {
     const urls: string[] = [];
     visit(tree, 'element', (node) => {
       // <link rel="stylesheet" href="...">
+      // → HTMLLinkElement-impl.js:79 fetchAndProcess() → :95 fetchStylesheet()
       if (
         node.tagName === 'link' &&
         [node.properties?.rel].flat().includes('stylesheet') &&
@@ -158,10 +182,12 @@ export class ResourceFetcher {
         urls.push(new URL(String(node.properties.href), baseUrl).href);
       }
       // <img src="...">
+      // → HTMLImageElement-impl.js:117 resourceLoader.fetch()
       if (node.tagName === 'img' && node.properties?.src) {
         urls.push(new URL(String(node.properties.src), baseUrl).href);
       }
       // <iframe src="..."> / <frame src="...">
+      // → HTMLFrameElement-impl.js:92 resourceLoader.fetch()
       if (
         (node.tagName === 'iframe' || node.tagName === 'frame') &&
         node.properties?.src
@@ -169,7 +195,11 @@ export class ResourceFetcher {
         urls.push(new URL(String(node.properties.src), baseUrl).href);
       }
       // NOTE: <script src> is NOT fetched — equivalent to @vivliostyle/jsdom
+      // → HTMLScriptElement-impl.js:53 _canRunScript() guards fetch;
+      //   vivliostyle-cli does not set runScripts: "dangerously"
     });
+    // TODO: stylesheets.js:95 scanForImportRules() — after fetching CSS,
+    // JSDOM recursively resolves @import rules. Not yet implemented here.
     return urls;
   }
 
