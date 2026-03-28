@@ -75,6 +75,7 @@ export async function buildPDF({
   const { browser, page } = await launchPreview({
     mode: 'build',
     url: viewerFullUrl,
+    renderMode: target.renderMode,
     config,
     onBrowserOpen: () => {
       Logger.logUpdate('Building pages');

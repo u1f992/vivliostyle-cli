@@ -30,6 +30,7 @@
     "@npmcli/arborist": "9.1.7",
     "@puppeteer/browsers": "2.10.5",
     "@vivliostyle/jsdom": "25.0.1-vivliostyle-cli.1",
+    "@vivliostyle/serve-browser": "github:u1f992/serve-browser",
     "@vivliostyle/vfm": "2.5.0",
     "@vivliostyle/viewer": "2.40.0",
     "ajv": "8.17.1",

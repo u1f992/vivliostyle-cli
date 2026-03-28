@@ -2,14 +2,13 @@ import { pathToFileURL } from 'node:url';
 import terminalLink from 'terminal-link';
 import upath from 'upath';
 import { type PreviewServer, build as viteBuild } from 'vite';
-import { cyan, gray } from 'yoctocolors';
+import { cyan } from 'yoctocolors';
 import { setupConfigFromFlags } from '../commands/cli-flags.js';
 import { loadVivliostyleConfig, warnDeprecatedConfig } from '../config/load.js';
 import { mergeConfig, mergeInlineConfig } from '../config/merge.js';
 import { isWebPubConfig, resolveTaskConfig } from '../config/resolve.js';
 import type { ParsedVivliostyleInlineConfig } from '../config/schema.js';
 import { resolveViteConfig } from '../config/vite.js';
-import { buildPDFWithContainer } from '../container.js';
 import { isUnicodeSupported, Logger, randomBookSymbol } from '../logger.js';
 import { buildPDF } from '../output/pdf.js';
 import { buildWebPublication } from '../output/webbook.js';
@@ -22,14 +21,8 @@ import {
 import { createViteServer, generateCmykReserveMap } from '../server.js';
 import { cwd, runExitHandlers } from '../util.js';
 
-export async function build(
-  inlineConfig: ParsedVivliostyleInlineConfig,
-  { containerForkMode = false }: { containerForkMode?: boolean } = {},
-) {
+export async function build(inlineConfig: ParsedVivliostyleInlineConfig) {
   Logger.setLogOptions(inlineConfig);
-  if (containerForkMode) {
-    Logger.setLogPrefix(gray('[Docker]'));
-  }
   Logger.debug('build > inlineConfig %O', inlineConfig);
 
   let vivliostyleConfig =
@@ -54,74 +47,65 @@ export async function build(
     });
 
     let server: PreviewServer | undefined;
-    if (!containerForkMode) {
-      // build dependents first
-      Logger.debug('build > viteConfig.configFile %s', viteConfig.configFile);
-      if (viteConfig.configFile && typeof config.serverRootDir === 'string') {
-        using _ = Logger.suspendLogging('Building Vite project');
-        await viteBuild({
-          configFile: viteConfig.configFile,
-          root: config.serverRootDir,
-        });
-      }
 
-      if (!inlineConfig.disableServerStartup) {
-        server = await createViteServer({
-          config,
-          viteConfig,
-          inlineConfig,
-          mode: 'build',
-        });
+    // build dependents first
+    Logger.debug('build > viteConfig.configFile %s', viteConfig.configFile);
+    if (viteConfig.configFile && typeof config.serverRootDir === 'string') {
+      using _ = Logger.suspendLogging('Building Vite project');
+      await viteBuild({
+        configFile: viteConfig.configFile,
+        root: config.serverRootDir,
+      });
+    }
 
-        if (server.httpServer) {
-          const addressInfo = server.httpServer.address();
-          if (addressInfo && typeof addressInfo !== 'string') {
-            const actualPort = addressInfo.port;
-            vivliostyleConfig = mergeConfig(vivliostyleConfig, {
-              temporaryFilePrefix: config.temporaryFilePrefix,
-              server: {
-                ...server.config.preview,
-                port: actualPort,
-              },
-            });
-            config = resolveTaskConfig(
-              vivliostyleConfig.tasks[i],
-              vivliostyleConfig.inlineOptions,
-            );
-          }
+    if (!inlineConfig.disableServerStartup) {
+      server = await createViteServer({
+        config,
+        viteConfig,
+        inlineConfig,
+        mode: 'build',
+      });
+
+      if (server.httpServer) {
+        const addressInfo = server.httpServer.address();
+        if (addressInfo && typeof addressInfo !== 'string') {
+          const actualPort = addressInfo.port;
+          vivliostyleConfig = mergeConfig(vivliostyleConfig, {
+            temporaryFilePrefix: config.temporaryFilePrefix,
+            server: {
+              ...server.config.preview,
+              port: actualPort,
+            },
+          });
+          config = resolveTaskConfig(
+            vivliostyleConfig.tasks[i],
+            vivliostyleConfig.inlineOptions,
+          );
         }
       }
-
-      // build artifacts
-      if (isWebPubConfig(config)) {
-        await cleanupWorkspace(config);
-        await prepareThemeDirectory(config);
-        await compile(config);
-        await copyAssets(config);
-      }
-
-      // Write CMYK reserve map if configured
-      generateCmykReserveMap(config);
     }
+
+    // build artifacts
+    if (isWebPubConfig(config)) {
+      await cleanupWorkspace(config);
+      await prepareThemeDirectory(config);
+      await compile(config);
+      await copyAssets(config);
+    }
+
+    // Write CMYK reserve map if configured
+    generateCmykReserveMap(config);
 
     // generate files
     for (const target of config.outputs) {
       let output: string | null = null;
       const { format } = target;
       if (format === 'pdf') {
-        if (!containerForkMode && target.renderMode === 'docker') {
-          output = await buildPDFWithContainer({
-            target,
-            config,
-            inlineConfig,
-          });
-        } else {
-          output = await buildPDF({ target, config });
-        }
+        output = await buildPDF({ target, config });
       } else if (format === 'webpub' || format === 'epub') {
         output = await buildWebPublication({ target, config });
       }
-      if (output && !containerForkMode) {
+      if (output) {
         const formattedOutput = cyan(
           upath.relative(inlineConfig.cwd ?? cwd, output),
         );
@@ -141,11 +125,9 @@ export async function build(
   }
 
   runExitHandlers();
-  if (!containerForkMode) {
-    const num = vivliostyleConfig.tasks.flatMap((t) => t.output ?? []).length;
-    const symbol = isUnicodeSupported
-      ? `${num > 1 ? '📚' : randomBookSymbol} `
-      : '';
-    Logger.log(`${symbol}Built successfully!`);
-  }
+  const num = vivliostyleConfig.tasks.flatMap((t) => t.output ?? []).length;
+  const symbol = isUnicodeSupported
+    ? `${num > 1 ? '📚' : randomBookSymbol} `
+    : '';
+  Logger.log(`${symbol}Built successfully!`);
 }

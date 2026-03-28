@@ -1,68 +1,36 @@
-import type {
-  InstalledBrowser,
-  Browser as SupportedBrowser,
-} from '@puppeteer/browsers';
-import fs from 'node:fs';
-import type {
-  Browser,
-  BrowserContext,
-  LaunchOptions,
-  Page,
-} from 'puppeteer-core';
-import upath from 'upath';
+import { serveBrowser } from '@vivliostyle/serve-browser';
+import type { Browser, HTTPRequest, Page } from 'puppeteer-core';
 import type { ResolvedTaskConfig } from './config/resolve.js';
 import type { BrowserType } from './config/schema.js';
+import { launchContainerBrowser } from './container.js';
 import { Logger } from './logger.js';
 import { importNodeModule } from './node-modules.js';
-import {
-  detectBrowserPlatform,
-  getCacheDir,
-  getDefaultBrowserTag,
-  isInContainer,
-  isRunningOnWSL,
-  registerExitHandler,
-} from './util.js';
+import { isRunningOnWSL, registerExitHandler } from './util.js';
 
-const browserEnumMap = {
-  chrome: 'chrome' as SupportedBrowser.CHROME,
-  chromium: 'chromium' as SupportedBrowser.CHROMIUM,
-  firefox: 'firefox' as SupportedBrowser.FIREFOX,
-} as const satisfies {
-  [key in BrowserType]: SupportedBrowser;
-};
-
-async function launchBrowser({
+function buildVivliostyleArgs({
   browserType,
-  proxy,
-  executablePath,
-  headless,
+  mode,
   noSandbox,
   disableDevShmUsage,
-  ignoreHttpsErrors,
-  protocolTimeout,
+  proxy,
 }: {
   browserType: BrowserType;
+  mode: 'preview' | 'build';
+  noSandbox: boolean;
+  disableDevShmUsage: boolean;
   proxy:
     | {
         server: string;
         bypass: string | undefined;
-        username: string | undefined;
-        password: string | undefined;
       }
     | undefined;
-  executablePath: string;
-  headless: boolean;
-  noSandbox: boolean;
-  disableDevShmUsage: boolean;
-  ignoreHttpsErrors: boolean;
-  protocolTimeout: number;
-}): Promise<{
-  browser: Browser;
-  browserContext: BrowserContext;
-}> {
-  const puppeteer = await importNodeModule('puppeteer-core');
-
+}): string[] {
   const args: string[] = [];
+
+  if (mode === 'build') {
+    args.push('--headless');
+  }
+
   // https://github.com/microsoft/playwright/blob/35709546cd4210b7744943ceb22b92c1b126d48d/packages/playwright-core/src/server/chromium/chromium.ts
   if (browserType === 'chrome' || browserType === 'chromium') {
     args.push(
@@ -83,7 +51,7 @@ async function launchBrowser({
     if (noSandbox) {
       args.push('--no-sandbox');
     }
-    if (headless) {
+    if (mode === 'build') {
       args.push(
         '--hide-scrollbars',
         '--mute-audio',
@@ -117,7 +85,7 @@ async function launchBrowser({
       args.push('--disable-dev-shm-usage');
     }
     // #357: Set devicePixelRatio=1 otherwise it causes layout issues in HiDPI displays
-    if (headless) {
+    if (mode === 'build') {
       args.push('--force-device-scale-factor=1');
     }
     // #565: Add --disable-gpu option when running on WSL
@@ -126,158 +94,19 @@ async function launchBrowser({
     }
     // set Chromium language to English to avoid locale-dependent issues
     args.push('--lang=en');
-    if (!headless && process.platform === 'darwin') {
+    if (mode !== 'build' && process.platform === 'darwin') {
       args.push('-AppleLanguages', '(en)');
     }
-    args.push('--no-startup-window');
   }
   // TODO: Investigate appropriate settings on Firefox
 
-  const launchOptions = {
-    executablePath,
-    args,
-    browser: browserType === 'chromium' ? 'chrome' : browserType,
-    headless,
-    acceptInsecureCerts: ignoreHttpsErrors,
-    waitForInitialPage: false,
-    protocolTimeout,
-  } satisfies LaunchOptions;
-  Logger.debug('launchOptions %O', launchOptions);
-  const browser = await puppeteer.launch({
-    ...launchOptions,
-    env: { ...process.env, LANG: 'en.UTF-8' },
-  });
-  registerExitHandler('Closing browser', async () => {
-    await browser.close();
-  });
-  const [browserContext] = browser.browserContexts();
-  return { browser, browserContext };
-}
-
-function getPuppeteerCacheDir() {
-  if (isInContainer()) {
-    return '/opt/puppeteer';
-  }
-  return upath.join(getCacheDir(), 'browsers');
-}
-
-interface BuildIdsCache {
-  createdAt: number;
-  buildIds: Record<string, Record<string, string>>;
-}
-
-async function resolveBuildId({
-  type,
-  tag,
-  browsers,
-}: Pick<ResolvedTaskConfig['browser'], 'type' | 'tag'> & {
-  browsers: typeof import('@puppeteer/browsers');
-}): Promise<string> {
-  // Return cached data to reduce network requests to browser registry
-  // Cache is valid for 24 hours
-  const cacheDataFilename = upath.join(
-    getPuppeteerCacheDir(),
-    'build-ids.json',
-  );
-  let cacheData: BuildIdsCache;
-  try {
-    cacheData = JSON.parse(fs.readFileSync(cacheDataFilename, 'utf-8'));
-    if (Date.now() - cacheData.createdAt > 24 * 60 * 60 * 1000) {
-      cacheData = { createdAt: Date.now(), buildIds: {} };
-    }
-  } catch (_) {
-    cacheData = { createdAt: Date.now(), buildIds: {} };
-  }
-  if (cacheData.buildIds[type]?.[tag]) {
-    return cacheData.buildIds[type][tag];
-  }
-
-  const platform = detectBrowserPlatform();
-  if (!platform) {
-    throw new Error('The current platform is not supported.');
-  }
-  const buildId = await browsers.resolveBuildId(
-    browserEnumMap[type],
-    platform,
-    tag,
-  );
-  (cacheData.buildIds[type] ??= {})[tag] = buildId;
-  fs.mkdirSync(upath.dirname(cacheDataFilename), { recursive: true });
-  fs.writeFileSync(cacheDataFilename, JSON.stringify(cacheData));
-  return buildId;
-}
-
-async function cleanupOutdatedBrowsers() {
-  for (const browser of Object.values(browserEnumMap)) {
-    const browsersDir = upath.join(getPuppeteerCacheDir(), browser);
-    if (!fs.existsSync(browsersDir)) {
-      continue;
-    }
-    const entries = fs.readdirSync(browsersDir);
-    for (const entry of entries) {
-      const entryPath = upath.join(browsersDir, entry);
-      const stat = fs.statSync(entryPath);
-      // Files that are not directories are temporary files created
-      // during downloads and should be deleted.
-      if (
-        !stat.isDirectory() ||
-        Date.now() - stat.mtimeMs > 7 * 24 * 60 * 60 * 1000
-      ) {
-        Logger.debug(`Removing outdated browser at ${entryPath}`);
-        await fs.promises.rm(entryPath, { recursive: true, force: true });
-      }
-    }
-  }
-}
-
-export async function getExecutableBrowserPath({
-  type,
-  tag,
-}: ResolvedTaskConfig['browser']): Promise<string> {
-  const browsers = await importNodeModule('@puppeteer/browsers');
-  const buildId = await resolveBuildId({ type, tag, browsers });
-  return browsers.computeExecutablePath({
-    cacheDir: getPuppeteerCacheDir(),
-    browser: browserEnumMap[type],
-    buildId,
-  });
-}
-
-function checkBrowserAvailability(path: string): boolean {
-  return fs.existsSync(path);
-}
-
-async function downloadBrowser({
-  type,
-  tag,
-}: ResolvedTaskConfig['browser']): Promise<string> {
-  const browsers = await importNodeModule('@puppeteer/browsers');
-  const buildId = await resolveBuildId({ type, tag, browsers });
-  let installedBrowser: InstalledBrowser | undefined;
-
-  if (isInContainer()) {
-    const defaultBrowserVersion = getDefaultBrowserTag('chrome');
-    Logger.logWarn(
-      `The container you are using already includes a browser (chrome@${defaultBrowserVersion}); however, the specified browser ${type}@${tag} was not found. Downloading the browser inside the container may take a long time. Consider using a container image that includes the required browser version.`,
-    );
-  }
-  {
-    using _ = Logger.suspendLogging(
-      'Rendering browser is not installed yet. Downloading now.',
-    );
-    installedBrowser = await browsers.install({
-      cacheDir: getPuppeteerCacheDir(),
-      browser: browserEnumMap[type],
-      buildId,
-      downloadProgressCallback: 'default',
-    });
-  }
-  return installedBrowser.executablePath;
+  return args;
 }
 
 export async function launchPreview({
   mode,
   url,
+  renderMode = 'local',
   onBrowserOpen,
   onPageOpen,
   config: {
@@ -286,56 +115,65 @@ export async function launchPreview({
     sandbox,
     ignoreHttpsErrors,
     timeout,
+    image,
   },
 }: {
   mode: 'preview' | 'build';
   url: string;
+  renderMode?: 'local' | 'docker';
   onBrowserOpen?: (browser: Browser) => void | Promise<void>;
   onPageOpen?: (page: Page) => void | Promise<void>;
   config: Pick<
     ResolvedTaskConfig,
-    'browser' | 'proxy' | 'sandbox' | 'ignoreHttpsErrors' | 'timeout'
+    'browser' | 'proxy' | 'sandbox' | 'ignoreHttpsErrors' | 'timeout' | 'image'
   >;
 }) {
-  let executableBrowser = browserConfig.executablePath;
-  Logger.debug(`Specified browser path: ${executableBrowser}`);
-  if (executableBrowser) {
-    if (!checkBrowserAvailability(executableBrowser)) {
-      throw new Error(
-        `Cannot find the browser. Please check the executable browser path: ${executableBrowser}`,
-      );
-    }
-  } else if (
-    detectBrowserPlatform() === 'linux_arm' &&
-    (browserConfig.type === 'chrome' || browserConfig.type === 'chromium')
-  ) {
-    // https://github.com/puppeteer/puppeteer/issues/7740
-    Logger.logInfo(
-      'The official Chrome/Chromium binaries are not available for ARM64 Linux. Using the system-installed Chromium browser instead.',
-    );
-    executableBrowser = '/usr/bin/chromium';
+  const puppeteer = await importNodeModule('puppeteer-core');
+
+  const args = buildVivliostyleArgs({
+    browserType: browserConfig.type,
+    mode,
+    noSandbox: !sandbox,
+    disableDevShmUsage: renderMode === 'docker',
+    proxy,
+  });
+
+  let wsEndpoint: string;
+
+  if (renderMode === 'docker') {
+    // Docker mode: launch serve-browser in a container
+    const port = 9222; // TODO: dynamic port allocation
+    const container = await launchContainerBrowser({
+      image,
+      browserType: browserConfig.type,
+      tag: browserConfig.tag,
+      port,
+      args,
+    });
+    wsEndpoint = container.wsEndpoint;
+    registerExitHandler('Stopping browser container', container.stop);
   } else {
-    executableBrowser = await getExecutableBrowserPath(browserConfig);
-    Logger.debug(`Using default browser: ${executableBrowser}`);
-    if (!checkBrowserAvailability(executableBrowser)) {
-      // The browser isn't downloaded first time starting CLI so try to download it
-      await cleanupOutdatedBrowsers();
-      await downloadBrowser(browserConfig);
-    }
+    // Local mode: use serve-browser API
+    const server = await serveBrowser({
+      browser: browserConfig.type,
+      tag: browserConfig.tag,
+      args,
+    });
+    wsEndpoint = server.wsEndpoint;
+    registerExitHandler('Closing browser', async () => {
+      await server[Symbol.asyncDispose]();
+    });
   }
 
-  const { browser, browserContext } = await launchBrowser({
-    browserType: browserConfig.type,
-    proxy,
-    executablePath: executableBrowser,
-    headless: mode === 'build',
-    noSandbox: !sandbox,
-    disableDevShmUsage: isInContainer(),
-    ignoreHttpsErrors,
+  Logger.debug(`Connecting to browser at ${wsEndpoint}`);
+  const browser = await puppeteer.connect({
+    browserWSEndpoint: wsEndpoint,
+    acceptInsecureCerts: ignoreHttpsErrors,
     protocolTimeout: timeout,
   });
   await onBrowserOpen?.(browser);
 
+  const [browserContext] = browser.browserContexts();
   const page =
     (await browserContext.pages())[0] ?? (await browserContext.newPage());
   await page.setViewport(
@@ -356,6 +194,37 @@ export async function launchPreview({
       password: proxy.password,
     });
   }
+
+  // In Docker mode, the container browser cannot reach the host's Vite server
+  // directly. Intercept requests and proxy them through the CDP connection.
+  if (renderMode === 'docker') {
+    await page.setRequestInterception(true);
+    const viteOrigin = new URL(url).origin;
+    page.on('request', async (request: HTTPRequest) => {
+      const requestUrl = request.url();
+      if (requestUrl.startsWith(viteOrigin)) {
+        try {
+          const response = await fetch(requestUrl);
+          const body = Buffer.from(await response.arrayBuffer());
+          const headers: Record<string, string> = {};
+          response.headers.forEach((value, key) => {
+            headers[key] = value;
+          });
+          await request.respond({
+            status: response.status,
+            headers,
+            body,
+          });
+        } catch (error) {
+          Logger.debug(`Proxy fetch failed for ${requestUrl}: ${error}`);
+          await request.abort('connectionrefused');
+        }
+      } else {
+        await request.continue();
+      }
+    });
+  }
+
   await page.goto(url);
 
   return { browser, page };

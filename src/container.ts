@@ -2,12 +2,10 @@ import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { x } from 'tinyexec';
 import upath from 'upath';
-import type { PdfOutput, ResolvedTaskConfig } from './config/resolve.js';
-import type { ParsedVivliostyleInlineConfig } from './config/schema.js';
-import { CONTAINER_LOCAL_HOSTNAME, CONTAINER_ROOT_DIR } from './constants.js';
+import type { ResolvedTaskConfig } from './config/resolve.js';
+import { CONTAINER_ROOT_DIR } from './constants.js';
 import { Logger } from './logger.js';
 import { importNodeModule } from './node-modules.js';
-import { getSourceUrl } from './server.js';
 import { exec, isValidUri, pathEquals } from './util.js';
 
 export function toContainerPath(urlOrAbsPath: string): string {
@@ -117,49 +115,98 @@ export async function runContainer({
   }
 }
 
-export async function buildPDFWithContainer({
-  target,
-  config,
-  inlineConfig,
+export async function launchContainerBrowser({
+  image,
+  browserType,
+  tag,
+  port,
+  args,
 }: {
-  target: PdfOutput;
-  config: ResolvedTaskConfig;
-  inlineConfig: ParsedVivliostyleInlineConfig;
-}): Promise<string | null> {
-  const sourceUrl = new URL(await getSourceUrl(config));
-  if (sourceUrl.origin === config.rootUrl) {
-    sourceUrl.hostname = CONTAINER_LOCAL_HOSTNAME;
-  }
-  const bypassedOption = {
-    ...inlineConfig,
-    input: {
-      format: 'webbook',
-      entry: sourceUrl.href,
-    },
-    output: [
-      {
-        ...target,
-        path: toContainerPath(target.path),
-      },
-    ],
-    host: CONTAINER_LOCAL_HOSTNAME,
-  } satisfies ParsedVivliostyleInlineConfig;
+  image: string;
+  browserType: string;
+  tag: string;
+  port: number;
+  args: string[];
+}): Promise<{ wsEndpoint: string; stop: () => Promise<void> }> {
+  const dockerArgs = [
+    'run',
+    '--rm',
+    '--entrypoint',
+    'serve-browser',
+    '-p',
+    `${port}:${port}`,
+    image,
+    '--browser',
+    browserType,
+    '--tag',
+    tag,
+    '--port',
+    String(port),
+    '--bind-address',
+    '0.0.0.0',
+    '--',
+    ...args,
+  ];
+  Logger.debug(`docker ${dockerArgs.join(' ')}`);
 
-  await runContainer({
-    image: config.image,
-    userVolumeArgs: collectVolumeArgs([
-      ...(typeof config.serverRootDir === 'string'
-        ? [config.serverRootDir]
-        : []),
-      upath.dirname(target.path),
-    ]),
-    env: [['VS_CLI_BUILD_PDF_OPTIONS', JSON.stringify(bypassedOption)]],
-    commandArgs: ['build'],
-    workdir:
-      typeof config.serverRootDir === 'string'
-        ? toContainerPath(config.serverRootDir)
-        : undefined,
+  const proc = x('docker', dockerArgs, {
+    nodeOptions: {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
   });
 
-  return target.path;
+  const child = proc.process;
+  if (!child?.stdout) {
+    throw new Error('Failed to start docker container');
+  }
+
+  // Forward stderr for download progress
+  child.stderr?.on('data', (chunk: Buffer) => {
+    process.stderr.write(chunk);
+  });
+
+  // Read wsEndpoint from stdout
+  const wsEndpoint = await new Promise<string>((resolve, reject) => {
+    let buffer = '';
+    const onData = (chunk: Buffer) => {
+      buffer += chunk.toString();
+      const lines = buffer.split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('ws://')) {
+          child!.stdout!.off('data', onData);
+          resolve(trimmed);
+          return;
+        }
+      }
+    };
+    child!.stdout!.on('data', onData);
+    child!.on('error', reject);
+    child!.on('exit', (code) => {
+      reject(
+        new Error(
+          `Docker container exited with code ${code} before providing wsEndpoint`,
+        ),
+      );
+    });
+  });
+
+  Logger.debug(`Container browser wsEndpoint: ${wsEndpoint}`);
+
+  return {
+    wsEndpoint,
+    async stop() {
+      if (child?.exitCode !== null) {
+        return;
+      }
+      child?.kill('SIGTERM');
+      await new Promise<void>((resolve) => {
+        child?.on('exit', () => resolve());
+        setTimeout(() => {
+          child?.kill('SIGKILL');
+          resolve();
+        }, 5000);
+      });
+    },
+  };
 }

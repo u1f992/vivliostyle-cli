@@ -94,16 +94,14 @@ WORKDIR /opt/vivliostyle-cli
 # Build stage
 FROM base AS builder
 COPY --chown=vivliostyle:vivliostyle . /opt/vivliostyle-cli
-RUN pnpm install && pnpm build
+RUN pnpm install --force && pnpm build
 
 # Runtime stage
 FROM base AS runtime
 ARG VS_CLI_VERSION
 RUN test $VS_CLI_VERSION
-COPY --chown=vivliostyle:vivliostyle . /opt/vivliostyle-cli
-RUN pnpm install --prod --ignore-scripts \
-  && echo $VS_CLI_VERSION > .vs-cli-version
-COPY --from=builder --chown=vivliostyle:vivliostyle /opt/vivliostyle-cli/dist/ /opt/vivliostyle-cli/dist/
+COPY --from=builder --chown=vivliostyle:vivliostyle /opt/vivliostyle-cli/ /opt/vivliostyle-cli/
+RUN echo $VS_CLI_VERSION > .vs-cli-version
 ENV PATH="/opt/vivliostyle-cli/node_modules/.bin:${PATH}"
 
 USER root
