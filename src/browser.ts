@@ -1,4 +1,5 @@
 import { serveBrowser } from '@vivliostyle/serve-browser';
+import net from 'node:net';
 import type { Browser, HTTPRequest, Page } from 'puppeteer-core';
 import type { ResolvedTaskConfig } from './config/resolve.js';
 import type { BrowserType } from './config/schema.js';
@@ -142,7 +143,17 @@ export async function launchPreview({
 
   if (renderMode === 'docker') {
     // Docker mode: launch serve-browser in a container
-    const port = 9222; // TODO: dynamic port allocation
+    // Find an available port starting from 9222, similar to Vite's port allocation
+    let port = 9222;
+    while (
+      await new Promise<boolean>((resolve) => {
+        const server = net.createServer();
+        server.once('error', () => resolve(true));
+        server.listen(port, () => server.close(() => resolve(false)));
+      })
+    ) {
+      port++;
+    }
     const container = await launchContainerBrowser({
       image,
       browserType: browserConfig.type,

@@ -1,3 +1,4 @@
+import net from 'node:net';
 import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { x } from 'tinyexec';
@@ -160,9 +161,12 @@ export async function launchContainerBrowser({
     throw new Error('Failed to start docker container');
   }
 
-  // Forward stderr for download progress
+  // Forward stderr (download progress, browser warnings)
   child.stderr?.on('data', (chunk: Buffer) => {
-    process.stderr.write(chunk);
+    const text = chunk.toString().trim();
+    if (text) {
+      Logger.debug(`[container] ${text}`);
+    }
   });
 
   // Read wsEndpoint from stdout
@@ -191,10 +195,13 @@ export async function launchContainerBrowser({
     });
   });
 
-  Logger.debug(`Container browser wsEndpoint: ${wsEndpoint}`);
+  const wsUrl = new URL(wsEndpoint);
+  wsUrl.hostname = '127.0.0.1';
+  const resolvedWsEndpoint = wsUrl.href;
+  Logger.debug(`Container browser wsEndpoint: ${resolvedWsEndpoint}`);
 
   return {
-    wsEndpoint,
+    wsEndpoint: resolvedWsEndpoint,
     async stop() {
       if (child?.exitCode !== null) {
         return;
