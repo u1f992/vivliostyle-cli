@@ -231,8 +231,15 @@ export const OutputFormat = v.union([
 ]);
 export type OutputFormat = v.InferInput<typeof OutputFormat>;
 
-export const RenderMode = v.union([v.literal('local'), v.literal('docker')]);
+export const RenderMode = v.union([
+  v.literal('local'),
+  v.literal('docker'),
+  v.literal('qemu'),
+]);
 export type RenderMode = v.InferInput<typeof RenderMode>;
+
+export const PreviewMode = v.union([v.literal('local'), v.literal('qemu')]);
+export type PreviewMode = v.InferInput<typeof PreviewMode>;
 
 const RGBValueObjectSchema = v.pipe(
   v.object({
@@ -954,6 +961,12 @@ export const BuildTask = v.pipe(
             Specify a browser type and version to launch the Vivliostyle viewer.
           `),
         ),
+        previewMode: v.pipe(
+          PreviewMode,
+          v.description($`
+            If set to \`qemu\`, Vivliostyle will use a QEMU VM for preview rendering. (default: \`local\`)
+          `),
+        ),
         base: v.pipe(
           ValidString,
           v.regex(/^\//, 'Base path must start with a slash'),
@@ -1221,7 +1234,13 @@ export const VivliostyleInlineConfigWithoutChecks = v.partial(
     renderMode: v.pipe(
       RenderMode,
       v.description($`
-          If docker is set, Vivliostyle try to render PDF on Docker container. [local]
+          If docker or qemu is set, Vivliostyle will render PDF using a Docker container or QEMU VM. [local]
+        `),
+    ),
+    previewMode: v.pipe(
+      PreviewMode,
+      v.description($`
+          If qemu is set, Vivliostyle will use a QEMU VM for preview rendering. [local]
         `),
     ),
     preflight: v.pipe(
@@ -1489,6 +1508,7 @@ export type InlineOptions = Pick<
   | 'enableViewerStartPage'
   | 'logger'
   | 'renderMode'
+  | 'previewMode'
   | 'preflight'
   | 'preflightOption'
   | 'cmyk'

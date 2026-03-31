@@ -5,6 +5,8 @@
 export const nodeExternalModules = [
   '@napi-rs/canvas',
   '@puppeteer/browsers',
+  '@vivliostyle/qemu-linux-x64',
+  '@vivliostyle/qemu-win32-x64',
   'command-exists',
   'mupdf',
   'press-ready',
@@ -15,6 +17,8 @@ export const nodeExternalModules = [
 type NodeExternalModules = {
   '@napi-rs/canvas': typeof import('@napi-rs/canvas');
   '@puppeteer/browsers': typeof import('@puppeteer/browsers');
+  '@vivliostyle/qemu-linux-x64': typeof import('@vivliostyle/qemu-linux-x64');
+  '@vivliostyle/qemu-win32-x64': typeof import('@vivliostyle/qemu-linux-x64');
   'command-exists': typeof import('command-exists');
   mupdf: typeof import('mupdf');
   'press-ready': typeof import('press-ready');

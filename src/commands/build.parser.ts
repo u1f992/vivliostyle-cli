@@ -110,7 +110,7 @@ This option is equivalent with "--preflight press-ready"`,
       new Option(
         '--render-mode <mode>',
         'if docker is set, Vivliostyle try to render PDF on Docker container [local]',
-      ).choices(['local', 'docker']),
+      ).choices(['local', 'docker', 'qemu']),
     )
     .addOption(
       new Option(

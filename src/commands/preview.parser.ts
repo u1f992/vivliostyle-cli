@@ -107,6 +107,12 @@ It is useful that using own viewer that has staging features. (ex: https://vivli
         `true to ignore HTTPS errors when Playwright browser opens a new page`,
       ),
     )
+    .addOption(
+      new Option(
+        '--preview-mode <mode>',
+        'if qemu is set, Vivliostyle will use a QEMU VM for preview rendering [local]',
+      ).choices(['local', 'qemu']),
+    )
     .option('--host <host>', 'IP address the server should listen on')
     .option('--port <port>', 'port the server should listen on', parseInt)
     .option('--no-open-viewer', 'do not open viewer')

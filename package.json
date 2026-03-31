@@ -80,6 +80,9 @@
     "yocto-spinner": "0.2.2",
     "yoctocolors": "2.1.1"
   },
+  "optionalDependencies": {
+    "@vivliostyle/qemu-linux-x64": "file:poc/vivliostyle-qemu-linux-x64-10.2.2.tgz"
+  },
   "devDependencies": {
     "@changesets/cli": "2.29.8",
     "@svitejs/changesets-changelog-github-compact": "1.2.0",

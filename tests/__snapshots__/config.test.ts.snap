@@ -137,6 +137,7 @@ Object {
       "path": "__WORKSPACE__/tests/fixtures/config/yuno",
     },
   ],
+  "previewMode": "local",
   "proxy": Object {
     "bypass": ".example.com",
     "password": "proxy-auth-password",
@@ -351,6 +352,7 @@ Object {
       "replaceImage": Array [],
     },
   ],
+  "previewMode": "local",
   "proxy": undefined,
   "quick": false,
   "readingProgression": "rtl",

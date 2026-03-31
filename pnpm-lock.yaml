@@ -303,6 +303,10 @@ importers:
       vitest:
         specifier: 3.1.2
         version: 3.1.2(@types/debug@4.1.12)(@types/node@22.15.2)(tsx@4.19.3)(yaml@2.8.1)
+    optionalDependencies:
+      '@vivliostyle/qemu-linux-x64':
+        specifier: file:poc/vivliostyle-qemu-linux-x64-10.2.2.tgz
+        version: file:poc/vivliostyle-qemu-linux-x64-10.2.2.tgz
 
   examples/asciidoc-processor:
     dependencies:
@@ -2178,6 +2182,12 @@ packages:
     peerDependenciesMeta:
       '@napi-rs/canvas':
         optional: true
+
+  '@vivliostyle/qemu-linux-x64@file:poc/vivliostyle-qemu-linux-x64-10.2.2.tgz':
+    resolution: {integrity: sha512-ysFm/S50tzt+92SJUFvxV94D9BuopYIN23lmZ0Dlyw699c4xDxc5uKwhhioP+df58CqgO81lu8BFO8cpydiphQ==, tarball: file:poc/vivliostyle-qemu-linux-x64-10.2.2.tgz}
+    version: 10.2.2
+    cpu: [x64]
+    os: [linux]
 
   '@vivliostyle/vfm@2.5.0':
     resolution: {integrity: sha512-YKVRx55MYGF/XF7oRCQaJHnzk0FjBMLEyp7IYXxWKMYZ51OP3HssfVPRSe+Lwv/FMNFvn/kwENXCfc0l8EKLvQ==}
@@ -8126,6 +8136,9 @@ snapshots:
       - bufferutil
       - supports-color
       - utf-8-validate
+
+  '@vivliostyle/qemu-linux-x64@file:poc/vivliostyle-qemu-linux-x64-10.2.2.tgz':
+    optional: true
 
   '@vivliostyle/vfm@2.5.0':
     dependencies:

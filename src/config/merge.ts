@@ -50,6 +50,7 @@ export function mergeInlineConfig(
     browser,
     output,
     renderMode,
+    previewMode,
     preflight,
     preflightOption,
     vite,
@@ -75,6 +76,7 @@ export function mergeInlineConfig(
         viewer,
         viewerParam,
         browser,
+        previewMode,
         vite,
         viteConfigFile,
       }),
@@ -95,6 +97,7 @@ export function mergeInlineConfig(
       ...pruneObject(inlineOptions),
       ...pruneObject({
         renderMode,
+        previewMode,
         preflight,
         preflightOption,
       }),

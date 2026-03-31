@@ -278,7 +278,7 @@ export type ReplaceImageConfig = ReplaceImageEntry[];
 export interface PdfOutput {
   format: 'pdf';
   path: string;
-  renderMode: 'local' | 'docker';
+  renderMode: 'local' | 'docker' | 'qemu';
   preflight: 'press-ready' | 'press-ready-local' | undefined;
   preflightOption: string[];
   cmyk: CmykConfig | false;
@@ -372,6 +372,7 @@ export type ResolvedTaskConfig = {
       }
     | undefined;
   image: string;
+  previewMode: 'local' | 'qemu';
   viewer: string | undefined;
   viewerParam: string | undefined;
   logLevel: 'silent' | 'info' | 'verbose' | 'debug';
@@ -672,6 +673,9 @@ export function resolveTaskConfig(
       }
     : undefined;
   const image = config.image ?? `${CONTAINER_URL}:${cliVersion}`;
+  const previewMode = (options.previewMode ?? config.previewMode ?? 'local') as
+    | 'local'
+    | 'qemu';
   const viewer = config.viewer ?? undefined;
   const viewerParam = config.viewerParam ?? undefined;
   const logLevel = options.logLevel ?? 'silent';
@@ -996,6 +1000,7 @@ export function resolveTaskConfig(
     browser,
     proxy,
     image,
+    previewMode,
     viewer,
     viewerParam,
     logLevel,

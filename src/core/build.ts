@@ -10,6 +10,7 @@ import { isWebPubConfig, resolveTaskConfig } from '../config/resolve.js';
 import type { ParsedVivliostyleInlineConfig } from '../config/schema.js';
 import { resolveViteConfig } from '../config/vite.js';
 import { buildPDFWithContainer } from '../container.js';
+import { buildPDFWithQemu } from '../qemu.js';
 import { isUnicodeSupported, Logger, randomBookSymbol } from '../logger.js';
 import { buildPDF } from '../output/pdf.js';
 import { buildWebPublication } from '../output/webbook.js';
@@ -115,6 +116,8 @@ export async function build(
             config,
             inlineConfig,
           });
+        } else if (target.renderMode === 'qemu') {
+          output = await buildPDFWithQemu({ target, config });
         } else {
           output = await buildPDF({ target, config });
         }

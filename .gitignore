@@ -1,6 +1,7 @@
 dist/
 tmp/
 *.pdf
+*.qcow2
 .vscode
 .vs-*
 .vivliostyle

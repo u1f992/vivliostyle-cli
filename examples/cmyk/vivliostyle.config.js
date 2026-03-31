@@ -3,6 +3,7 @@ import { defineConfig } from '@vivliostyle/cli';
 
 export default defineConfig({
   entry: ['manuscript.html'],
+  output: [{ path: 'output.pdf', renderMode: 'qemu' }],
   pdfPostprocess: {
     cmyk: {
       reserveMap: [

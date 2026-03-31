@@ -28,9 +28,10 @@ export interface CliFlags {
   language?: string;
   readingProgression?: 'ltr' | 'rtl';
   timeout?: number;
-  renderMode?: 'local' | 'docker';
+  renderMode?: 'local' | 'docker' | 'qemu';
   preflight?: 'press-ready' | 'press-ready-local';
   preflightOption?: string[];
+  previewMode?: 'local' | 'qemu';
   sandbox?: boolean;
   executableBrowser?: string;
   image?: string;

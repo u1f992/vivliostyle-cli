@@ -697,3 +697,44 @@ it('output-level pdfPostprocess.preflight overrides output.preflight', async () 
     preflight: 'press-ready-local',
   });
 });
+
+it('parse qemu render mode from config', async () => {
+  const config = await getTaskConfig(['build'], resolveFixture('config'), {
+    entry: ['manuscript.md'],
+    output: [{ path: 'output.pdf', renderMode: 'qemu' }],
+  });
+  expect(config.outputs[0]).toMatchObject({
+    format: 'pdf',
+    renderMode: 'qemu',
+  });
+});
+
+it('parse qemu render mode from CLI flag', async () => {
+  const config = await getTaskConfig(
+    ['build', '--render-mode', 'qemu'],
+    resolveFixture('config'),
+    {
+      entry: ['manuscript.md'],
+      output: ['output.pdf'],
+    },
+  );
+  expect(config.outputs[0]).toMatchObject({
+    format: 'pdf',
+    renderMode: 'qemu',
+  });
+});
+
+it('parse qemu preview mode from config', async () => {
+  const config = await getTaskConfig(['build'], resolveFixture('config'), {
+    entry: ['manuscript.md'],
+    previewMode: 'qemu',
+  });
+  expect(config.previewMode).toBe('qemu');
+});
+
+it('default preview mode is local', async () => {
+  const config = await getTaskConfig(['build'], resolveFixture('config'), {
+    entry: ['manuscript.md'],
+  });
+  expect(config.previewMode).toBe('local');
+});
