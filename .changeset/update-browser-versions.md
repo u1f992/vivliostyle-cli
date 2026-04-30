@@ -4,6 +4,6 @@
 
 Update default browser versions
 
-- Chrome: 146.0.7680.153
-- Chromium: 1603217
-- Firefox: stable_148.0.2
+- Chrome: 148.0.7778.97
+- Chromium: 1622798
+- Firefox: stable_150.0.1
