@@ -1,5 +1,11 @@
 # @vivliostyle/cli
 
+## 10.6.0
+
+### Minor Changes
+
+- Update Vivliostyle.js to 2.42.0: CSS Nesting Support and Footnote Enhancements ([#787](https://github.com/vivliostyle/vivliostyle-cli/pull/787))
+
 ## 10.5.0
 
 ### Minor Changes
